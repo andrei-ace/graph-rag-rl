@@ -1,0 +1,17 @@
+# GitHub repository
+git+https://github.com/THU-MIG/yolov10.git
+
+# Other dependencies
+torch
+accelerate
+torch_geometric
+transformers
+ultralytics
+matplotlib
+pdf2image
+pytesseract
+opencv-python-headless
+tqdm
+joblib
+argparse
+numpy
