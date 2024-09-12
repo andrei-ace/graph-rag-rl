@@ -30,7 +30,9 @@ def get_nvidia_nim_embeddings(
         payload = {
             "input": batch,
             "model": model,
-            "input_type": "query"
+            "input_type": "query",
+            "encoding_format": "float",
+            "truncate": "END"
         }
         
         response = requests.post(embeddings_url, headers=headers, data=json.dumps(payload))

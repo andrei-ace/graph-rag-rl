@@ -3,3 +3,4 @@
 __cache__/
 __pycache__/
 models/
+docs/output/

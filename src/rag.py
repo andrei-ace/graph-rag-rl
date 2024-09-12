@@ -3,6 +3,8 @@ from graphs import extract_text_from_graph, split_graph
 from embeddings import get_nvidia_nim_embeddings
 import requests
 import json
+import torch
+import math
 
 from config import RANK_MODEL, RANK_URL
 
@@ -26,22 +28,37 @@ def evaluate_answer(question, retrieved_text, correct_answer,
     response = requests.post(url, headers=headers, data=json.dumps(payload))
     if response.status_code == 200:
         results = response.json()
-        # Assuming the API returns scores in the same order as the input passages
-        retrieved_score = results['scores'][0]
-        correct_score = results['scores'][1]
-        # Calculate similarity as the ratio of retrieved_score to correct_score
-        similarity = retrieved_score / correct_score if correct_score != 0 else 0
-        return similarity
+        retrieved_logit = results['rankings'][0]['logit']
+        correct_logit = results['rankings'][1]['logit']
+        
+        # Apply softmax to normalize logits
+        exp_retrieved = math.exp(retrieved_logit)
+        exp_correct = math.exp(correct_logit)
+        total = exp_retrieved + exp_correct
+        
+        retrieved_prob = exp_retrieved / total
+        correct_prob = exp_correct / total
+        
+        # Calculate similarity based on normalized probabilities
+        similarity = 1 - abs(retrieved_prob - correct_prob)
+        
+        return similarity  # Already in [0, 1] range
     else:
         print(f"Error: {response.status_code}")
         return 0  # Return 0 similarity in case of error
 
 
 def retrieve_relevant_text(question_embedding, text_embeddings, texts, top_k=1):
-    # Compute cosine similarities
-    similarities = cosine_similarity(question_embedding.unsqueeze(0), text_embeddings)
+    # Convert question_embedding to a tensor if it's not already
+    question_embedding = torch.tensor(question_embedding).unsqueeze(0)
+    
+    # Ensure text_embeddings is also a tensor
+    text_embeddings = torch.tensor(text_embeddings)
+    
+    similarities = cosine_similarity(question_embedding, text_embeddings, dim=1)
     # Sort indices of similarities in descending order
     top_k_indices = similarities.argsort(descending=True)[:top_k]
+    
     return " ".join([texts[idx] for idx in top_k_indices])
 
 
@@ -58,7 +75,7 @@ def rag(graph, nodes, edges, questions_answers):
 
     results = []
     for question, provided_answer, question_embedding in zip(questions, answers, question_embeddings):
-        relevant_text = retrieve_relevant_text(question_embedding, text_embeddings, texts, top_k=1)
+        relevant_text = retrieve_relevant_text(question_embedding, text_embeddings, texts)
         score = evaluate_answer(question, relevant_text, provided_answer)
         results.append((question, provided_answer, relevant_text, score))
 
