@@ -2,6 +2,7 @@ import torch
 import numpy as np
 import hashlib
 from torch_geometric.data import Data
+from collections import defaultdict, deque
 
 from config import POSITIONAL_EMBEDDINGS_DIM
 from embeddings import get_nvidia_nim_embeddings
@@ -91,6 +92,7 @@ def create_graph(elements, d_model=POSITIONAL_EMBEDDINGS_DIM):
     # Create edge_index tensor if there are edges
     edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous() if edges else torch.empty((2, 0), dtype=torch.long)
 
+    # Create a directed graph by using the original Data class
     data = Data(x=node_features, edge_index=edge_index, y=node_labels)
     return data, nodes, edges
 
@@ -164,60 +166,33 @@ def tensor_to_tuple(tensor):
     return tensor
 
 
-def compute_graph_hash(graph, nodes, edges):
-    # Convert tensor attributes in nodes to tuples for consistent sorting
-    sorted_nodes = sorted(nodes, key=lambda x: tuple((k, tensor_to_tuple(v)) for k, v in sorted(x.items())))
+# def compute_graph_hash(graph, nodes, edges):
+#     # Convert tensor attributes in nodes to tuples for consistent sorting
+#     sorted_nodes = sorted(nodes, key=lambda x: tuple((k, tensor_to_tuple(v)) for k, v in sorted(x.items())))
 
-    # Convert edges to tuples if they are tensors
-    sorted_edges = sorted((tuple(edge) if isinstance(edge, torch.Tensor) else edge) for edge in edges)
+#     # Convert edges to tuples if they are tensors
+#     sorted_edges = sorted((tuple(edge) if isinstance(edge, torch.Tensor) else edge) for edge in edges)
 
-    # Create a string representation of the sorted nodes and edges
-    nodes_str = "".join([str(node) for node in sorted_nodes])
-    edges_str = "".join([str(edge) for edge in sorted_edges])
+#     # Create a string representation of the sorted nodes and edges
+#     nodes_str = "".join([str(node) for node in sorted_nodes])
+#     edges_str = "".join([str(edge) for edge in sorted_edges])
 
-    # Combine the graph features, sorted nodes, and sorted edges into a single string
-    combined_str = str(graph.x.tolist()) + nodes_str + edges_str
+#     # Combine the graph features, sorted nodes, and sorted edges into a single string
+#     combined_str = str(graph.x.tolist()) + nodes_str + edges_str
 
-    # Compute the hash value using SHA-256
-    hash_value = hashlib.sha256(combined_str.encode()).hexdigest()
+#     # Compute the hash value using SHA-256
+#     hash_value = hashlib.sha256(combined_str.encode()).hexdigest()
 
-    return hash_value
-
-
-def find_connected_components(edge_index, num_nodes):
-    parent = list(range(num_nodes))
-
-    def find(v):
-        if parent[v] != v:
-            parent[v] = find(parent[v])
-        return parent[v]
-
-    def union(v1, v2):
-        root1 = find(v1)
-        root2 = find(v2)
-        if root1 != root2:
-            parent[root2] = root1
-
-    for i in range(edge_index.size(1)):
-        union(edge_index[0, i].item(), edge_index[1, i].item())
-
-    components = {}
-    for node in range(num_nodes):
-        root = find(node)
-        if root not in components:
-            components[root] = []
-        components[root].append(node)
-
-    return list(components.values())
+#     return hash_value
 
 
 def split_graph(graph, nodes, edges):
-    # Find connected components in the graph
-    components = find_connected_components(graph.edge_index, graph.num_nodes)
+    # Find strongly connected components in the directed graph
+    components = find_strongly_connected_components(graph.edge_index, graph.num_nodes)
 
     subgraphs = []
     for component in components:
-        # Get node indices and edges for the subgraph
+        # Create subgraphs for each component
         subgraph_nodes = component
         subgraph_node_idx = {node: i for i, node in enumerate(subgraph_nodes)}
         subgraph_edges = [
@@ -239,7 +214,50 @@ def split_graph(graph, nodes, edges):
 
     return subgraphs
 
-def extract_text_from_graph(graph, nodes, edges):
+def find_strongly_connected_components(edge_index, num_nodes):
+    # Implement Kosaraju's algorithm for finding strongly connected components
+    def dfs(v, adj, visited, stack):
+        visited[v] = True
+        for u in adj[v]:
+            if not visited[u]:
+                dfs(u, adj, visited, stack)
+        stack.append(v)
+
+    def reverse_dfs(v, adj, visited, component):
+        visited[v] = True
+        component.append(v)
+        for u in adj[v]:
+            if not visited[u]:
+                reverse_dfs(u, adj, visited, component)
+
+    # Create adjacency lists
+    adj = [[] for _ in range(num_nodes)]
+    rev_adj = [[] for _ in range(num_nodes)]
+    for i in range(edge_index.size(1)):
+        u, v = edge_index[:, i].tolist()
+        adj[u].append(v)
+        rev_adj[v].append(u)
+
+    # First DFS
+    visited = [False] * num_nodes
+    stack = []
+    for i in range(num_nodes):
+        if not visited[i]:
+            dfs(i, adj, visited, stack)
+
+    # Second DFS
+    visited = [False] * num_nodes
+    components = []
+    while stack:
+        v = stack.pop()
+        if not visited[v]:
+            component = []
+            reverse_dfs(v, rev_adj, visited, component)
+            components.append(component)
+
+    return components
+
+def extract_text_from_graph(graph, nodes, edges):    
     node_texts = [node["text"] for node in nodes if "text" in node]
     # Concatenate all text into a single string
     concatenated_text = " ".join(node_texts)

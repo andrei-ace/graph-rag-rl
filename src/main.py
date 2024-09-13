@@ -16,7 +16,7 @@ from visuals import visualize_graph
 from questions import PDFS
 from rag import rag
 
-device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
 
 EPOCHS = 100
 # Define a cache directory
@@ -63,6 +63,7 @@ def infer_pdf(pdf_entry, ppo, device=device):
         trajectory, merged_graph, merged_nodes, merged_edges = ppo.infer_trajectory(
             merged_graph, merged_nodes, merged_edges
         )
+        print(f"length of trajectory: {len(trajectory)}")
         save_path = "docs/output/with_trainig.png"
     visualize_graph(merged_image, merged_nodes, merged_edges, save_path=save_path)
     results = rag(merged_graph, merged_nodes, merged_edges, questions_answers)
@@ -91,14 +92,22 @@ if __name__ == "__main__":
         os.makedirs(CACHE_DIR, exist_ok=True)
     
     print(f"Using device: {device}")
-    input_dim = EMBEDDINGS_SIZE + len(CLASS_NAMES) + 4*POSITIONAL_EMBEDDINGS_DIM
-    print(f"Input dimension: {input_dim}")
+    print(f"Device type: {device.type}")
+    print(f"Device capabilities:")
+    print(f"  CUDA available: {torch.cuda.is_available()}")
+    if device.type == 'cuda':
+        print(f"  CUDA device name: {torch.cuda.get_device_name(0)}")
+        print(f"  CUDA device count: {torch.cuda.device_count()}")
+        print(f"  CUDA version: {torch.version.cuda}")
+    print(f"PyTorch version: {torch.__version__}")
+    mean_score_notrain = infer_pdf(PDFS[-1], None)
+    print(f"Mean scores no training: {mean_score_notrain:.4f}")
+    input_dim = EMBEDDINGS_SIZE + len(CLASS_NAMES) + 4*POSITIONAL_EMBEDDINGS_DIM    
     ppo = PPO(input_dim=input_dim, device=device)
     pbar = tqdm(range(EPOCHS), desc="Training PPO")
     for _ in pbar:
-        for pdf_entry in PDFS[:-1]:
-            train_pdf(pdf_entry, ppo)
-        mean_score_notrain = infer_pdf(PDFS[-1], None)
+        for pdf_entry in PDFS[:-1]:        
+            train_pdf(pdf_entry, ppo)        
         mean_score_withtrain = infer_pdf(PDFS[-1], ppo)
         pbar.set_postfix({
             'No Train': f'{mean_score_notrain:.4f}',

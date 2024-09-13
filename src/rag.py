@@ -59,11 +59,12 @@ def retrieve_relevant_text(question_embedding, text_embeddings, texts, top_k=1):
     # Sort indices of similarities in descending order
     top_k_indices = similarities.argsort(descending=True)[:top_k]
     
-    return " ".join([texts[idx] for idx in top_k_indices])
+    return [texts[idx] for idx in top_k_indices]
 
 
 def rag(graph, nodes, edges, questions_answers):
     subgraphs = split_graph(graph, nodes, edges)
+    print(f"Found {len(subgraphs)} subgraphs")
     texts = []
     for subgraph, nodes, edges in subgraphs:
         txt = extract_text_from_graph(subgraph, nodes, edges)
@@ -75,8 +76,15 @@ def rag(graph, nodes, edges, questions_answers):
 
     results = []
     for question, provided_answer, question_embedding in zip(questions, answers, question_embeddings):
-        relevant_text = retrieve_relevant_text(question_embedding, text_embeddings, texts)
-        score = evaluate_answer(question, relevant_text, provided_answer)
-        results.append((question, provided_answer, relevant_text, score))
+        relevant_text_list = retrieve_relevant_text(question_embedding, text_embeddings, texts, top_k=10)
+        scores = []
+        for relevant_text in relevant_text_list:
+            score = evaluate_answer(question, relevant_text, provided_answer)
+            scores.append(score)
+        # Choose the best score
+        best_score = max(scores)
+        best_index = scores.index(best_score)
+        best_relevant_text = relevant_text_list[best_index]
+        results.append((question, provided_answer, best_relevant_text, best_score))
 
     return results

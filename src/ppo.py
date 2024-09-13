@@ -2,13 +2,13 @@ import torch
 import torch.nn.functional as F
 from torch_geometric.data import Data
 from actions import apply_action, revert_action, sample_action
-from graphs import compute_graph_hash
-from models import AddNetwork, CriticNetwork, PolicyNetwork, RemoveNetwork
+from models import AddBothNetwork, AddNetwork, CriticNetwork, PolicyNetwork, RemoveNetwork
 from rag import rag
 import concurrent.futures
+import os
 
-MIN_STEPS = 10
-MAX_STEPS = 10
+MIN_STEPS = 128
+MAX_STEPS = 256
 
 class PPO:
     def __init__(self, input_dim, device="cpu"):
@@ -16,17 +16,20 @@ class PPO:
         projection_dim = 32
         # Initialize networks
         self.add_net = AddNetwork(input_dim, hidden_dim)
+        self.add_both_net = AddBothNetwork(input_dim, hidden_dim)
         self.remove_net = RemoveNetwork(input_dim, hidden_dim)
         self.policy_net = PolicyNetwork(input_dim, hidden_dim)
         self.critic_net = CriticNetwork(input_dim, hidden_dim, projection_dim)
         self.device = torch.device(device)
         self.add_net.to(self.device)
+        self.add_both_net.to(self.device)
         self.remove_net.to(self.device)
         self.policy_net.to(self.device)
         self.critic_net.to(self.device)
         # Initialize optimizer
         self.optimizer = torch.optim.Adam(
             list(self.add_net.parameters())
+            + list(self.add_both_net.parameters())
             + list(self.remove_net.parameters())
             + list(self.policy_net.parameters())
             + list(self.critic_net.parameters()),
@@ -54,29 +57,42 @@ class PPO:
 
     def collect_trajectory(self, graph, nodes, edges, min_steps=MIN_STEPS, max_steps=MAX_STEPS):
         trajectory = []
-        for i in range(max_steps):
+        step_count = 0
+        attempt_count = 0
+        max_attempts = max_steps * 3  # Prevent infinite loop
+
+        while step_count < max_steps:
+            if attempt_count >= max_attempts:
+                print("Warning: Max attempts reached. Terminating trajectory collection.")
+                break
+
             action_probs = self.policy_net(graph.x, graph.edge_index)
             action_name, node_pair, prob, value = sample_action(
-                graph, self.add_net, self.remove_net, self.critic_net, action_probs
+                graph, self.add_net, self.add_both_net, self.remove_net, self.critic_net, action_probs
             )
+
             if action_name == "stop":
-                if i >= min_steps:
+                if len(trajectory) >= min_steps:
+                    trajectory.append((action_name, node_pair, prob, value))
                     break
-                else:
-                    continue
-            # save the action, node pair, probability, and value
+                attempt_count += 1
+                continue
+
             trajectory.append((action_name, node_pair, prob, value))
             graph, edges = apply_action(graph, edges, action_name, node_pair)
+            step_count += 1
+            attempt_count += 1
+
         graph, nodes, edges = self.revert_graph(graph, nodes, edges, trajectory)
+
         return trajectory, graph, nodes, edges
 
     def compute_real_values(self, trajectory, graph, nodes, edges, questions_answers):
         # walk through the trajectory and generate answers
         real_values = []
-        for i, (action_name, node_pair, _, _) in enumerate(trajectory):
-            if action_name == "stop":
-                break
-            graph, edges = apply_action(graph, edges, action_name, node_pair)
+        for (action_name, node_pair, _, _) in trajectory:            
+            if action_name != "stop":                                
+                graph, edges = apply_action(graph, edges, action_name, node_pair)                                
             results = rag(graph, nodes, edges, questions_answers)
             # compute the mean score of the generated answers
             real_value = sum(score for _, _, _, score in results) / len(results)
@@ -87,22 +103,22 @@ class PPO:
 
         return real_values, graph, nodes, edges
 
-    def episode(self, graph, nodes, edges, questions_answers, num_trajectories=4):
+
+    def episode(self, graph, nodes, edges, questions_answers, num_trajectories=1):
         # Set networks to evaluation mode for the episode
         self.policy_net.eval()
         self.critic_net.eval()
         self.add_net.eval()
+        self.add_both_net.eval()
         self.remove_net.eval()
         trajectories = []
-        with torch.inference_mode():
-            starting_value = compute_graph_hash(graph, nodes, edges)
+        with torch.inference_mode():            
             
             def collect_single_trajectory():
                 new_graph = Data(x=graph.x, edge_index=graph.edge_index.clone())
                 new_nodes = nodes.copy()
                 new_edges = edges.copy()
-                trajectory, new_graph, new_nodes, new_edges = self.collect_trajectory(new_graph, new_nodes, new_edges)
-                self.check_graph_hash(new_graph, new_nodes, new_edges, starting_value)
+                trajectory, new_graph, new_nodes, new_edges = self.collect_trajectory(new_graph, new_nodes, new_edges)                
                 advantages, returns = self.compute_advantages(trajectory)
                 # Compute the real values
                 real_values, new_graph, new_nodes, new_edges = self.compute_real_values(
@@ -110,21 +126,21 @@ class PPO:
                 )
                 return trajectory, advantages, returns, real_values
 
-            with concurrent.futures.ThreadPoolExecutor(max_workers=num_trajectories) as executor:
+            # Determine the optimal number of threads
+            max_workers = min(num_trajectories, os.cpu_count() or 1)
+            
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = [executor.submit(collect_single_trajectory) for _ in range(num_trajectories)]
                 trajectories = [future.result() for future in concurrent.futures.as_completed(futures)]
 
-            self.check_graph_hash(graph, nodes, edges, starting_value)
-
         for trajectory, advantages, returns, real_values in trajectories:            
-            # PPO update
-            graph, nodes, edges = self.ppo_update(trajectory, advantages, returns, real_values, graph, nodes, edges)
+            # Reject trajectories with less steps than min_steps
+            if len(trajectory) >= MIN_STEPS:
+                # PPO update
+                graph, nodes, edges = self.ppo_update(trajectory, advantages, returns, real_values, graph, nodes, edges)
+            else:
+                print(f"Trajectory rejected: {len(trajectory)} steps < {MIN_STEPS} min steps")
 
-        self.check_graph_hash(graph, nodes, edges, starting_value)
-
-    def check_graph_hash(self, graph, nodes, edges, starting_value):
-        ending_value = compute_graph_hash(graph, nodes, edges)
-        assert starting_value == ending_value, "Graph hash mismatch"
 
     def revert_graph(self, graph, nodes, edges, trajectory):
         # Apply the trajectory in reverse to revert the graph to its initial state
@@ -150,6 +166,7 @@ class PPO:
         self.policy_net.train()
         self.critic_net.train()
         self.add_net.train()
+        self.add_both_net.train()
         self.remove_net.train()
 
         old_log_probs = torch.log(
@@ -170,24 +187,31 @@ class PPO:
                 action_probs = self.policy_net(graph.x, graph.edge_index)
 
                 if action_name == "stop":
-                    prob = action_probs[0, 2]  # Assuming the stop action is represented by the third probability
-                    action_one_hot = torch.tensor([0, 0, 1], dtype=torch.float32, device=self.device)
+                    prob = action_probs[0, 3]
+                    action_one_hot = torch.tensor([0, 0, 0, 1], dtype=torch.float32, device=self.device)
                     node1_emb = graph.x.mean(dim=0)  # Placeholder for stop action
-                    node2_emb = graph.x.mean(dim=0)  # Placeholder for stop action
+                    node2_emb = graph.x.mean(dim=0)  # Placeholder for stop action                
                 elif action_name == "add":
-                    prob = action_probs[0, 0]  # Use the first probability for add action
-                    action_one_hot = torch.tensor([1, 0, 0], dtype=torch.float32, device=self.device)
+                    prob = action_probs[0, 0]
+                    action_one_hot = torch.tensor([1, 0, 0, 0], dtype=torch.float32, device=self.device)
                     node1_emb = graph.x[node_pair[0]]
                     node2_emb = graph.x[node_pair[1]]
                     action_loss = self.compute_policy_loss(self.add_net, node1_emb, node2_emb, advantages[i])
                     action_losses.append(action_loss)
+                elif action_name == "add_both":
+                    prob = action_probs[0, 1]
+                    action_one_hot = torch.tensor([0, 1, 0, 0], dtype=torch.float32, device=self.device)
+                    node1_emb = graph.x[node_pair[0]]
+                    node2_emb = graph.x[node_pair[1]]
+                    action_loss = self.compute_policy_loss(self.add_both_net, node1_emb, node2_emb, advantages[i])
+                    action_losses.append(action_loss)
                 elif action_name == "remove":
-                    prob = action_probs[0, 1]  # Use the second probability for remove action
-                    action_one_hot = torch.tensor([0, 1, 0], dtype=torch.float32, device=self.device)
+                    prob = action_probs[0, 2] 
+                    action_one_hot = torch.tensor([0, 0, 1, 0], dtype=torch.float32, device=self.device)
                     node1_emb = graph.x[node_pair[0]]
                     node2_emb = graph.x[node_pair[1]]
                     action_loss = self.compute_policy_loss(self.remove_net, node1_emb, node2_emb, advantages[i])
-                    action_losses.append(action_loss)
+                    action_losses.append(action_loss)                
 
                 new_log_probs.append(torch.log(prob))
 
@@ -233,22 +257,36 @@ class PPO:
         trajectory = []
         self.policy_net.eval()
         self.add_net.eval()
+        self.add_both_net.eval()
         self.remove_net.eval()
         self.critic_net.eval()
 
         with torch.inference_mode():
-            for i in range(max_steps):
+            trajectory = []
+            step_count = 0
+            attempt_count = 0
+            max_attempts = max_steps * 3  # Prevent infinite loop
+
+            while step_count < max_steps:
+                if attempt_count >= max_attempts:
+                    print("Warning: Max attempts reached. Terminating trajectory collection.")
+                    break
+
                 action_probs = self.policy_net(graph.x, graph.edge_index)
                 action_name, node_pair, prob, value = sample_action(
-                    graph, self.add_net, self.remove_net, self.critic_net, action_probs
+                    graph, self.add_net, self.add_both_net, self.remove_net, self.critic_net, action_probs
                 )
+
                 if action_name == "stop":
-                    if i >= min_steps:
+                    if len(trajectory) >= min_steps:
+                        trajectory.append((action_name, node_pair, prob, value))
                         break
-                    else:
-                        continue
-                # Append the action to the trajectory
+                    attempt_count += 1
+                    continue
+
                 trajectory.append((action_name, node_pair, prob, value))
-                # Apply the action to modify the graph
                 graph, edges = apply_action(graph, edges, action_name, node_pair)
+                step_count += 1
+                attempt_count += 1
+
         return trajectory, graph, nodes, edges

@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 
 OFFSET = 10
 CIRCLE_RADIUS = 5
+TIP_SIZE = 25
 
 
 def visualize_graph(image_pil, nodes, edges, save_path=None):
@@ -45,15 +46,19 @@ def visualize_graph(image_pil, nodes, edges, save_path=None):
         # Add small random offset to avoid overlapping lines
         offset_i = (random.randint(-OFFSET, OFFSET), random.randint(-OFFSET, OFFSET))
         offset_j = (random.randint(-OFFSET, OFFSET), random.randint(-OFFSET, OFFSET))
-        center_i = (center_i[0] + offset_i[0], center_i[1] + offset_i[1])
-        center_j = (center_j[0] + offset_j[0], center_j[1] + offset_j[1])
+        start = (center_i[0] + offset_i[0], center_i[1] + offset_i[1])
+        end = (center_j[0] + offset_j[0], center_j[1] + offset_j[1])
 
-        # Draw the line
-        cv2.line(image_cv, center_i, center_j, color=(0, 255, 0), thickness=2)
+        # Calculate the line length
+        line_length = np.sqrt((end[0] - start[0])**2 + (end[1] - start[1])**2)                        
+        # Calculate tipLength as a ratio of TIP_SIZE to line_length
+        tip_length = min(TIP_SIZE / line_length, 0.3)  # Cap at 0.3 to avoid overly large arrow tips
+        
+        cv2.arrowedLine(image_cv, start, end, color=(0, 255, 0), thickness=2, tipLength=tip_length)
 
         # Draw dots at the ends of the edges
-        cv2.circle(image_cv, center_i, radius=CIRCLE_RADIUS, color=(255, 0, 0), thickness=-1)
-        cv2.circle(image_cv, center_j, radius=CIRCLE_RADIUS, color=(255, 0, 0), thickness=-1)
+        cv2.circle(image_cv, start, radius=CIRCLE_RADIUS, color=(255, 0, 0), thickness=-1)
+        cv2.circle(image_cv, end, radius=CIRCLE_RADIUS, color=(255, 0, 0), thickness=-1)
 
         # Mark this edge as drawn
         drawn_edges.add((edge[0], edge[1]))
