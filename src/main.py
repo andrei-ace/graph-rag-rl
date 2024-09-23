@@ -18,7 +18,7 @@ from rag import rag
 
 device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
 
-EPOCHS = 100
+EPOCHS = 2
 # Define a cache directory
 CACHE_DIR = "__cache__"
 
