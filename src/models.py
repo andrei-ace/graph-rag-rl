@@ -24,8 +24,8 @@ class PolicyNetwork(nn.Module):
         x = F.relu(self.gcn2(x, edge_index))
         gcn = F.relu(self.gcn3(x, edge_index))
         x1 = torch.mean(gcn, dim=0, keepdim=True)  # Pooling node embeddings
-        x2,_ = torch.max(gcn, dim=0, keepdim=True)  # Pooling node embeddings        
-        graph_pooling = torch.cat([x1, x2], dim=1)        
+        x2,_ = torch.max(gcn, dim=0, keepdim=True)  # Pooling node embeddings
+        graph_pooling = torch.cat([x1, x2], dim=1)
         # sample node_id1
         node1_soft = F.gumbel_softmax(self.mask_logits(gcn, edge_index, None, self.node_1(graph_pooling)), tau=self.temperature, hard=False, dim=-1)        
         node1_idx = torch.argmax(node1_soft, dim=-1)

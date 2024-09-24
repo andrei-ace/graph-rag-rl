@@ -1,20 +1,23 @@
+from math import sqrt
 import torch
 import torch.nn.functional as F
 from torch_geometric.data import Data
 from models import CriticNetwork, PolicyNetwork
 from rag import rag
+from graphs import find_strongly_connected_components
 import concurrent.futures
 import os
 
-MAX_STEPS = 3
+MAX_STEPS = 64
 
 class PPO:
-    def __init__(self, input_dim, device="cpu"):
+    def __init__(self, input_dim, shaped_reward_coef=0.1, device="cpu"):
         hidden_dim = 64
         # Initialize networks
         self.policy_net = PolicyNetwork(input_dim, hidden_dim)
         self.critic_net = CriticNetwork(input_dim, hidden_dim)
         self.device = torch.device(device)
+        self.shaped_reward_coef = shaped_reward_coef
         self.policy_net.to(self.device)
         self.critic_net.to(self.device)
         # Initialize optimizer
@@ -27,84 +30,56 @@ class PPO:
         self.value_loss_fn = torch.nn.MSELoss()
         self.policy_loss_fn = torch.nn.CrossEntropyLoss()        
 
-    def compute_advantages(self, trajectory, gamma=0.99):
-        # trajectory: (action_name, node_pair, action_prob, pair_prob, value, total_log_prob, node1_emb, node2_emb, reward) 
-        rewards = [reward for _, _, _, _, _, _, _, _, reward in trajectory]
-        values = [value for _, _, _, _, value, _, _, _, _ in trajectory]
-        advantages = []
-        returns = []
-        G = 0
-        for t in reversed(range(len(rewards))):
-            G = rewards[t] + gamma * G
-            returns.insert(0, G)
-            advantage = G - values[t]
-            advantages.insert(0, advantage)
-        return advantages, returns
+    def shaped_reward_value(self, graph, nodes, edges, questions_answers):
+        # Reward for how close the number of strongly connected components (SCC) is to the square root of the number of nodes
+        # The reward is 1 if the number of SCC is equal to the square root of the number of nodes, and decreases as the number of SCC increases or decreases
+        scc_len = len(find_strongly_connected_components(graph.edge_index, len(nodes)))
+        target_scc = sqrt(len(nodes))
+        reward = 1.0 - abs(scc_len - target_scc) / target_scc
+        return reward
+
+    def evaluate_value(self, graph, nodes, edges, questions_answers):
+        # results = rag(graph, nodes, edges, questions_answers)
+        # score = sum([score for _, _, _, score in results]) / len(results)
+        score = self.shaped_reward_value(graph, nodes, edges, questions_answers) * self.shaped_reward_coef
+        return score
 
 
-    def edge_exists(self, edge_index, node1, node2):
-        edge_list = edge_index.t().tolist()
-        return [node1, node2] in edge_list or [node2, node1] in edge_list
+    def apply_action(self, graph, edges, nodes, node1_idx, node2_idx, edge_type_idx):        
+        match (edge_type_idx):
+            case 0:
+                graph.edge_index = torch.cat((graph.edge_index, torch.tensor([[node1_idx], [node2_idx]], device=self.device)), dim=1)
+                edges.append((node1_idx, node2_idx))
+            case 1:
+                graph.edge_index = torch.cat((graph.edge_index, torch.tensor([[node2_idx], [node1_idx]], device=self.device)), dim=1)
+                edges.append((node2_idx, node1_idx))
+            case 2:
+                graph.edge_index = torch.cat((graph.edge_index, torch.tensor([[node1_idx, node2_idx], [node2_idx, node1_idx]], device=self.device)), dim=1)
+                edges.append((node1_idx, node2_idx))
+                edges.append((node2_idx, node1_idx))
+        return graph, edges, nodes
     
-
-
-
-    # def compute_real_values(self, trajectory, graph, nodes, edges, questions_answers):
-    #     real_values = []
-    #     rewards = []
-    #     previous_real_value = None
-    #     # trajectory: (action_name, node_pair, action_prob, pair_prob, value, total_log_prob, node1_emb, node2_emb, reward)
-    #     for idx, (action_name, node_pair, prob, pair_prob, value, total_log_prob, node1_emb, node2_emb, _) in enumerate(trajectory):
-    #         # Apply the action
-    #         if action_name != "stop":
-    #             graph, edges = apply_action(graph, edges, action_name, node_pair)
-
-    #         # Compute the real value at this step
-    #         results = rag(graph, nodes, edges, questions_answers)
-    #         real_value = sum(score for _, _, _, score in results) / len(results)
-    #         real_values.append(real_value)
-
-    #         # Compute the reward as the change in real value
-    #         if previous_real_value is not None:
-    #             reward = real_value - previous_real_value
-    #         else:
-    #             reward = real_value  # For the first step
-    #         rewards.append(reward)
-    #         previous_real_value = real_value
-
-    #         # Update the trajectory with the real reward
-    #         # trajectory: (action_name, node_pair, action_prob, pair_prob, value, total_log_prob, node1_emb, node2_emb, reward)
-    #         trajectory[idx] = (action_name, node_pair, prob, pair_prob, value, total_log_prob, node1_emb, node2_emb, reward)
-
-    #     # Revert the graph to its initial state
-    #     graph, nodes, edges = self.revert_graph(graph, nodes, edges, trajectory)
-    #     return real_values, rewards, graph, nodes, edges
-
-
-    def collect_trajectory(self, graph, edges, nodes, max_steps=MAX_STEPS):
+    def collect_trajectory(self, graph, edges, nodes, questions_answers, max_steps=MAX_STEPS):
         trajectory = []
         graph = graph.to(self.device)
         self.policy_net.eval()
         self.critic_net.eval()
         with torch.inference_mode():
             stop_idx = 0
+            current_value = self.evaluate_value(graph, nodes, edges, questions_answers)
             for _ in range(max_steps):
                 node1_soft, node2_soft, edge_type_soft, stop_soft = self.policy_net(graph.x, graph.edge_index)            
                 node1_idx = node1_soft.argmax().item()
                 node2_idx = node2_soft.argmax().item()
                 edge_type_idx = edge_type_soft.argmax().item()
-                stop_idx = stop_soft.argmax().item()
-                action_prob = (node1_soft[0][node1_idx] * node2_soft[0][node2_idx] * edge_type_soft[0][edge_type_idx] * stop_soft[0][stop_idx]).item()
-                trajectory.append(((node1_idx, node2_idx), edge_type_idx, stop_idx, action_prob))                
+                done = stop_soft.argmax().item()
+                action_prob = (node1_soft[0][node1_idx] * node2_soft[0][node2_idx] * edge_type_soft[0][edge_type_idx]).item()                                
                 # apply the action
-                match (edge_type_idx):
-                    case 0:
-                        edges.append((node1_idx, node2_idx))
-                    case 1:
-                        edges.append((node2_idx, node1_idx))
-                    case 2:
-                        edges.append((node1_idx, node2_idx))
-                        edges.append((node2_idx, node1_idx))
+                graph, edges, nodes = self.apply_action(graph, edges, nodes, node1_idx, node2_idx, edge_type_idx)
+                value = self.evaluate_value(graph, nodes, edges, questions_answers)
+                reward = value - current_value
+                current_value = value
+                trajectory.append(((node1_idx, node2_idx), edge_type_idx, action_prob, reward, done))
                 if stop_idx == 1:
                     break
                                 
@@ -115,15 +90,21 @@ class PPO:
         # Set networks to evaluation mode for the episode
         self.policy_net.eval()
         self.critic_net.eval()        
-        trajectories = []
-        with torch.inference_mode():                        
-            new_graph = Data(x=graph.x, edge_index=graph.edge_index.clone())
-            new_edges = edges.copy()
-            new_nodes = nodes.copy()
-            for _ in range(max_steps):
-                trajectory, new_graph, new_edges, new_nodes = self.collect_trajectory(new_graph, new_edges, new_nodes)
-                print(trajectory)
+        trajectories = []        
+        with torch.inference_mode():
+            starting_fc_score = self.evaluate_value(graph, nodes, edges, questions_answers)
+            for _ in range(num_trajectories):                        
+                new_graph = Data(x=graph.x, edge_index=graph.edge_index.clone())            
+                new_edges = edges.copy()
+                new_nodes = nodes.copy()
+                
+                trajectory, new_graph, new_edges, new_nodes = self.collect_trajectory(new_graph, new_edges, new_nodes, questions_answers)                
                 trajectories.append(trajectory)
+                print(trajectory)
+                total_reward = sum([step[3] for step in trajectory])
+                print(f"Total reward: {total_reward:.3f}")
+                ending_fc_score = self.evaluate_value(new_graph, new_nodes, new_edges, questions_answers)
+                print(f"Starting FC score: {starting_fc_score:.3f}, Ending FC score: {ending_fc_score:.3f}")
             
         #     def collect_single_trajectory():
         #         new_graph = Data(x=graph.x, edge_index=graph.edge_index.clone())
@@ -157,12 +138,12 @@ class PPO:
         #         print(f"Trajectory rejected: {len(trajectory)} steps < {MIN_STEPS} min steps")
 
 
-    def revert_graph(self, graph, nodes, edges, trajectory):
-        # trajectory: (action_name, node_pair, action_prob, pair_prob, value, total_log_prob, node1_emb, node2_emb, reward)
-        # Apply the trajectory in reverse to revert the graph to its initial state
-        for action_name, node_pair, _, _, _, _, _, _, _ in reversed(trajectory):
-            graph, edges = revert_action(graph, edges, action_name, node_pair)
-        return graph, nodes, edges
+    # def revert_graph(self, graph, nodes, edges, trajectory):
+    #     # trajectory: (action_name, node_pair, action_prob, pair_prob, value, total_log_prob, node1_emb, node2_emb, reward)
+    #     # Apply the trajectory in reverse to revert the graph to its initial state
+    #     for action_name, node_pair, _, _, _, _, _, _, _ in reversed(trajectory):
+    #         graph, edges = revert_action(graph, edges, action_name, node_pair)
+    #     return graph, nodes, edges
     
     def compute_policy_loss(self, edge_prob, advantage):
         target = (
