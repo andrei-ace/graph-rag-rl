@@ -69,7 +69,7 @@ class CriticNetwork(nn.Module):
         self.gcn1 = GCNConv(input_dim, hidden_dim)
         self.gcn2 = GCNConv(hidden_dim, hidden_dim)
         self.gcn3 = GCNConv(hidden_dim, hidden_dim)
-        self.fc1 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc1 = nn.Linear(hidden_dim * 2, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, 1)
 
     def forward(self, x, edge_index):
