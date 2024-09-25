@@ -18,7 +18,7 @@ from rag import rag
 
 device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
 
-EPOCHS = 2
+EPOCHS = 10
 # Define a cache directory
 CACHE_DIR = "__cache__"
 
@@ -74,12 +74,12 @@ def infer_pdf(pdf_entry, ppo, device=device):
     return mean_score
 
 
-def train_pdf(pdf_entry, ppo, device=device):
+def train_pdf(pdf_entry, ppo, episode_num, device=device):
     (pdf_path, questions_answers) = pdf_entry
     cache_key = os.path.basename(pdf_path)
     merged_graph, merged_nodes, merged_edges, _ = cache_results(cache_key, process_pdf, pdf_path)
     merged_graph = merged_graph.to(device)
-    ppo.episode(merged_graph, merged_nodes, merged_edges, questions_answers)
+    ppo.run_episode(episode_num, merged_graph, merged_nodes, merged_edges, questions_answers)
 
 
 if __name__ == "__main__":
@@ -103,11 +103,11 @@ if __name__ == "__main__":
     mean_score_notrain = infer_pdf(PDFS[-1], None)
     print(f"Mean scores no training: {mean_score_notrain:.4f}")
     input_dim = EMBEDDINGS_SIZE + len(CLASS_NAMES) + 4*POSITIONAL_EMBEDDINGS_DIM    
-    ppo = PPO(input_dim=input_dim, device=device)
+    ppo = PPO(input_dim=input_dim, device=device, episodes=EPOCHS)
     pbar = tqdm(range(EPOCHS), desc="Training PPO")
-    for _ in pbar:
+    for episode_num in pbar:
         for pdf_entry in PDFS[:-1]:        
-            train_pdf(pdf_entry, ppo)        
+            train_pdf(pdf_entry, ppo, episode_num)        
         mean_score_withtrain = infer_pdf(PDFS[-1], ppo)
         pbar.set_postfix({
             'No Train': f'{mean_score_notrain:.4f}',

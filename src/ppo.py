@@ -9,10 +9,10 @@ import concurrent.futures
 import os
 from statistics import variance
 
-MAX_STEPS = 128
+MAX_STEPS = 64
 
 class PPO:
-    def __init__(self, input_dim, shaped_reward_coef=0.1, device="cpu"):
+    def __init__(self, input_dim, shaped_reward_coef=0.1, device="cpu", episodes=10):
         hidden_dim = 64
         # Initialize networks
         self.policy_net = PolicyNetwork(input_dim, hidden_dim)
@@ -28,14 +28,15 @@ class PPO:
             lr=1e-3,
         )
         # Initialize loss functions for PPO
-        self.value_loss_fn = torch.nn.MSELoss()
-        self.policy_loss_fn = torch.nn.CrossEntropyLoss()        
+        self.value_loss_fn = torch.nn.MSELoss()        
+        self.episodes = episodes
 
-    def shaped_reward_value(self, graph, nodes, edges, questions_answers):
+    def calculate_shaped_reward(self, graph):
+        num_nodes = graph.num_nodes
         # Get the strongly connected components
-        sccs = find_strongly_connected_components(graph.edge_index, len(nodes))
+        sccs = find_strongly_connected_components(graph.edge_index, num_nodes)
         scc_len = len(sccs)
-        target_scc = sqrt(len(nodes))
+        target_scc = sqrt(num_nodes)
 
         # Reward for how close the number of SCCs is to the square root of the number of nodes
         num_scc_reward = 1.0 - abs(scc_len - target_scc) / target_scc
@@ -43,25 +44,28 @@ class PPO:
         # Reward for low variance in SCC sizes
         scc_sizes = [len(scc) for scc in sccs]
         size_variance = variance(scc_sizes) if len(scc_sizes) > 1 else 0
-        max_possible_variance = ((len(nodes) - scc_len + 1) ** 2) * (scc_len - 1) / (4 * scc_len)
+        max_possible_variance = ((num_nodes - scc_len + 1) ** 2) * (scc_len - 1) / (4 * scc_len)
         size_variance_reward = 1.0 - (size_variance / max_possible_variance if max_possible_variance > 0 else 0)
 
         # Penalty for large SCCs
-        avg_scc_size = len(nodes) / scc_len
-        large_scc_penalty = sum([len(scc) for scc in sccs if len(scc) > 2 * avg_scc_size]) / len(nodes)
+        avg_scc_size = num_nodes / scc_len
+        large_scc_penalty = sum([len(scc) for scc in sccs if len(scc) > 2 * avg_scc_size]) / num_nodes
 
         # Combine the rewards and penalties (you can adjust the weights as needed)
         reward = 0.4 * num_scc_reward + 0.4 * size_variance_reward - 0.2 * large_scc_penalty
         return reward
 
-    def evaluate_value(self, graph, nodes, edges, questions_answers):
-        # results = rag(graph, nodes, edges, questions_answers)
-        # score = sum([score for _, _, _, score in results]) / len(results)
-        score = self.shaped_reward_value(graph, nodes, edges, questions_answers) * self.shaped_reward_coef
+    def evaluate_graph_value(self, graph, nodes, edges, questions_answers, episode_num, split=0.5):
+        if questions_answers is None or episode_num < self.episodes * split:
+            score = self.calculate_shaped_reward(graph) * self.shaped_reward_coef
+        else:
+            results = rag(graph, nodes, edges, questions_answers)
+            score = sum([score for _, _, _, score in results]) / len(results)
+    
         return score
 
 
-    def apply_action(self, graph, nodes, edges, node1_idx, node2_idx, edge_type_idx):        
+    def modify_graph(self, graph, nodes, edges, node1_idx, node2_idx, edge_type_idx):        
         match (edge_type_idx):
             case 0:
                 graph.edge_index = torch.cat((graph.edge_index, torch.tensor([[node1_idx], [node2_idx]], device=self.device)), dim=1)
@@ -75,14 +79,14 @@ class PPO:
                 edges.append((node2_idx, node1_idx))
         return graph, nodes, edges
     
-    def collect_trajectory(self, graph, nodes, edges, questions_answers, max_steps=MAX_STEPS):
+    def generate_trajectory(self, graph, nodes, edges, questions_answers, episode_num, max_steps=MAX_STEPS):
         trajectory = []
         graph = graph.to(self.device)
         self.policy_net.eval()
         self.critic_net.eval()
         with torch.inference_mode():
             stop_idx = 0
-            current_value = self.evaluate_value(graph, nodes, edges, questions_answers)
+            current_value = self.evaluate_graph_value(graph, nodes, edges, questions_answers, episode_num)
             for _ in range(max_steps):
                 node1_soft, node2_soft, edge_type_soft, stop_soft = self.policy_net(graph.x, graph.edge_index)            
                 node1_idx = node1_soft.argmax().item()
@@ -91,8 +95,8 @@ class PPO:
                 done = stop_soft.argmax().item()
                 action_prob = (node1_soft[0][node1_idx] * node2_soft[0][node2_idx] * edge_type_soft[0][edge_type_idx]).item()                                
                 # apply the action
-                graph, nodes, edges = self.apply_action(graph, nodes, edges, node1_idx, node2_idx, edge_type_idx)
-                value = self.evaluate_value(graph, nodes, edges, questions_answers)
+                graph, nodes, edges = self.modify_graph(graph, nodes, edges, node1_idx, node2_idx, edge_type_idx)
+                value = self.evaluate_graph_value(graph, nodes, edges, questions_answers, episode_num)
                 reward = value - current_value
                 current_value = value
                 trajectory.append(((node1_idx, node2_idx), edge_type_idx, action_prob, reward, done))
@@ -101,7 +105,7 @@ class PPO:
                                 
         return trajectory, graph, nodes, edges
 
-    def compute_advantages(self, trajectory, graph, nodes, edges, gamma=0.99, lambda_=0.95):
+    def compute_advantages_and_returns(self, trajectory, graph, nodes, edges, gamma=0.99, lambda_=0.95):
         # Move to device
         graph = graph.to(self.device)
         advantages = []
@@ -117,7 +121,7 @@ class PPO:
             values.append(current_value.item())
             
             # Apply the action to advance the graph state
-            graph, nodes, edges = self.apply_action(graph, nodes, edges, node1_idx, node2_idx, edge_type_idx)
+            graph, nodes, edges = self.modify_graph(graph, nodes, edges, node1_idx, node2_idx, edge_type_idx)
         
         # Compute value for the final state
         final_value = self.critic_net(graph.x, graph.edge_index).squeeze().item()
@@ -145,7 +149,7 @@ class PPO:
 
         return advantages, returns
 
-    def episode(self, graph, nodes, edges, questions_answers, num_trajectories=10, max_steps=MAX_STEPS):
+    def run_episode(self, episode_num, graph, nodes, edges, questions_answers, num_trajectories=4):
         # Set networks to evaluation mode for the episode
         self.policy_net.eval()
         self.critic_net.eval()        
@@ -158,7 +162,7 @@ class PPO:
                 new_graph = Data(x=graph.x, edge_index=graph.edge_index.clone())                
                 new_edges = edges.copy()                
                 new_nodes = nodes.copy()
-                trajectory, new_graph, new_nodes, new_edges = self.collect_trajectory(new_graph, new_nodes, new_edges, questions_answers)                
+                trajectory, new_graph, new_nodes, new_edges = self.generate_trajectory(new_graph, new_nodes, new_edges, questions_answers, episode_num)                
                 trajectories.append(trajectory)                
             
                 # total_reward = sum([step[3] for step in trajectory])
@@ -170,7 +174,7 @@ class PPO:
                 new_graph = Data(x=graph.x, edge_index=graph.edge_index.clone())                
                 new_edges = edges.copy()
                 new_nodes = nodes.copy()
-                advantages, returns = self.compute_advantages(trajectory, new_graph, new_nodes, new_edges)
+                advantages, returns = self.compute_advantages_and_returns(trajectory, new_graph, new_nodes, new_edges)
                 advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)                
                 advantages = advantages.tolist()
                 returns = returns.tolist()
@@ -178,9 +182,9 @@ class PPO:
                 returns_all.append(returns)
 
         for trajectory, advantages, returns in zip(trajectories, advantages_all, returns_all):
-            self.ppo_update(trajectory, advantages, returns, graph, nodes, edges)
+            self.update_policy(trajectory, advantages, returns, graph, nodes, edges)
         
-    def ppo_update(self, trajectory, advantages, returns, graph, nodes, edges, epsilon=0.2, epochs=10):
+    def update_policy(self, trajectory, advantages, returns, graph, nodes, edges, epsilon=0.2, epochs=10):
         graph = graph.to(self.device)
         self.policy_net.train()
         self.critic_net.train()
@@ -205,7 +209,7 @@ class PPO:
                 value_new = self.critic_net(current_graph.x, current_graph.edge_index)
                 new_values.append(value_new)
 
-                current_graph, current_edges, _ = self.apply_action(current_graph, current_edges, nodes, node1_idx, node2_idx, edge_type_idx)
+                current_graph, current_edges, _ = self.modify_graph(current_graph, current_edges, nodes, node1_idx, node2_idx, edge_type_idx)
 
             new_log_probs = torch.stack(new_log_probs)
             new_values = torch.stack(new_values).squeeze()
@@ -241,12 +245,9 @@ class PPO:
                 action_prob = (node1_soft[0][node1_idx] * node2_soft[0][node2_idx] * edge_type_soft[0][edge_type_idx]).item()
                 
                 # Apply the action
-                graph, nodes, edges = self.apply_action(graph, nodes, edges, node1_idx, node2_idx, edge_type_idx)
+                graph, nodes, edges = self.modify_graph(graph, nodes, edges, node1_idx, node2_idx, edge_type_idx)                
                 
-                # Evaluate the new state
-                value = self.evaluate_value(graph, nodes, edges, questions_answers=None)
-                
-                trajectory.append(((node1_idx, node2_idx), edge_type_idx, action_prob, value, done))
+                trajectory.append(((node1_idx, node2_idx), edge_type_idx, action_prob, 0, done))
                 
                 if done == 1:
                     break
