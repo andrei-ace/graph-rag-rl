@@ -9,7 +9,7 @@ import concurrent.futures
 import os
 from statistics import variance
 
-MAX_STEPS = 64
+MAX_STEPS = 128
 
 class PPO:
     def __init__(self, input_dim, shaped_reward_coef=0.1, device="cpu", episodes=10):
@@ -55,12 +55,16 @@ class PPO:
         reward = 0.4 * num_scc_reward + 0.4 * size_variance_reward - 0.2 * large_scc_penalty
         return reward
 
-    def evaluate_graph_value(self, graph, nodes, edges, questions_answers, episode_num, split=0.5):
+    def evaluate_graph_value(self, graph, nodes, edges, done, questions_answers, episode_num, split=0.5):
         if questions_answers is None or episode_num < self.episodes * split:
             score = self.calculate_shaped_reward(graph) * self.shaped_reward_coef
         else:
-            results = rag(graph, nodes, edges, questions_answers)
-            score = sum([score for _, _, _, score in results]) / len(results)
+            # Only evaluate the score if the episode is done
+            if done:
+                results = rag(graph, nodes, edges, questions_answers)
+                score = sum([score for _, _, _, score in results]) / len(results)
+            else:
+                score = 0
     
         return score
 
@@ -86,17 +90,18 @@ class PPO:
         self.critic_net.eval()
         with torch.inference_mode():
             stop_idx = 0
-            current_value = self.evaluate_graph_value(graph, nodes, edges, questions_answers, episode_num)
-            for _ in range(max_steps):
+            current_value = self.evaluate_graph_value(graph, nodes, edges, False, questions_answers, episode_num)
+            for i in range(max_steps):
                 node1_soft, node2_soft, edge_type_soft, stop_soft = self.policy_net(graph.x, graph.edge_index)            
                 node1_idx = node1_soft.argmax().item()
                 node2_idx = node2_soft.argmax().item()
                 edge_type_idx = edge_type_soft.argmax().item()
                 done = stop_soft.argmax().item()
+                last_step = i == max_steps - 1 or done == 1
                 action_prob = (node1_soft[0][node1_idx] * node2_soft[0][node2_idx] * edge_type_soft[0][edge_type_idx]).item()                                
                 # apply the action
                 graph, nodes, edges = self.modify_graph(graph, nodes, edges, node1_idx, node2_idx, edge_type_idx)
-                value = self.evaluate_graph_value(graph, nodes, edges, questions_answers, episode_num)
+                value = self.evaluate_graph_value(graph, nodes, edges, last_step, questions_answers, episode_num)
                 reward = value - current_value
                 current_value = value
                 trajectory.append(((node1_idx, node2_idx), edge_type_idx, action_prob, reward, done))
