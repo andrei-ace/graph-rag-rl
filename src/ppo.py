@@ -19,7 +19,7 @@ class PPO:
                  episodes=100,
                  shaped_reward_coef=0.1, 
                  split=0.5, 
-                 start_temp=5.0, 
+                 start_temp=5.0,
                  end_temp=0.1, 
                  decay_rate=0.1, 
                  num_trajectories=8,
@@ -284,6 +284,8 @@ class PPO:
 
             for i, ((node1_idx, node2_idx), edge_type_idx, _, _, done) in enumerate(trajectory):
                 node1_soft, node2_soft, edge_type_soft, stop_soft = self.policy_net(current_graph.x, current_graph.edge_index)
+                if node1_soft is None or node2_soft is None or edge_type_soft is None or stop_soft is None:
+                    break
                 log_action_prob = torch.log(node1_soft[0][node1_idx] * node2_soft[0][node2_idx] * 
                                             edge_type_soft[0][edge_type_idx] * stop_soft[0][0] + 1e-10)
                 new_log_probs.append(log_action_prob)

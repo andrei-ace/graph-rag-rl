@@ -19,7 +19,7 @@ from rag import rag
 
 device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
 
-EPOCHS = 10
+EPOCHS = 100
 # Define a cache directory
 CACHE_DIR = "__cache__"
 
@@ -89,21 +89,25 @@ def determine_temperature(ppo, episode_num):
     phase3_length = ppo.episodes * ppo.split / 2
     phase4_length = ppo.episodes * (1 - ppo.split) / 2
 
+    # Define the intermediate stop point as 2/3 of the distance between start_temp and end_temp
+    intermediate_temp = ppo.end_temp + (ppo.start_temp - ppo.end_temp) * (1 / 3)
+
     if episode_num < phase1_length:
-        # Phase 1: Explore with shaped reward
-        return ppo.start_temp + (ppo.end_temp - ppo.start_temp) * (episode_num / phase1_length)
+        # Phase 1: Explore with shaped reward, stopping at 2/3 point
+        return ppo.start_temp + (intermediate_temp - ppo.start_temp) * (episode_num / phase1_length)
     elif episode_num < phase1_length + phase2_length:
-        # Phase 2: Exploit with shaped reward
+        # Phase 2: Exploit with shaped reward (exponential decay starting from intermediate point)
         adjusted_episode_num = episode_num - phase1_length
-        return ppo.end_temp * math.exp(-ppo.decay_rate * adjusted_episode_num)
+        return intermediate_temp * math.exp(-ppo.decay_rate * adjusted_episode_num)
     elif episode_num < phase1_length + phase2_length + phase3_length:
-        # Phase 3: Explore with real reward
+        # Phase 3: Explore with real reward, stopping at 2/3 point
         adjusted_episode_num = episode_num - (phase1_length + phase2_length)
-        return ppo.start_temp + (ppo.end_temp - ppo.start_temp) * (adjusted_episode_num / phase3_length)
+        return ppo.start_temp + (intermediate_temp - ppo.start_temp) * (adjusted_episode_num / phase3_length)
     else:
-        # Phase 4: Exploit with real reward
+        # Phase 4: Exploit with real reward (exponential decay starting from intermediate point)
         adjusted_episode_num = episode_num - (phase1_length + phase2_length + phase3_length)
-        return ppo.end_temp * math.exp(-ppo.decay_rate * adjusted_episode_num)
+        return intermediate_temp * math.exp(-ppo.decay_rate * adjusted_episode_num)
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Process PDF with optional caching.")
