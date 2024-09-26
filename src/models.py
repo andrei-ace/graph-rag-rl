@@ -7,16 +7,23 @@ MASK_VALUE = -1e9
 
 # Define the policy network
 class PolicyNetwork(nn.Module):
-    def __init__(self, input_dim, hidden_dim, max_num_nodes=1000, temperature=0.5):
+    def __init__(self, input_dim, hidden_dim, max_num_nodes=1000, temperature=0.1):
         super(PolicyNetwork, self).__init__()
         self.temperature = temperature
         self.gcn1 = GCNConv(input_dim, hidden_dim)
         self.gcn2 = GCNConv(hidden_dim, hidden_dim)
         self.gcn3 = GCNConv(hidden_dim, hidden_dim)
-        self.node_1 = nn.Linear(hidden_dim * 2, max_num_nodes)
-        self.node_2 = nn.Linear(hidden_dim * 2, max_num_nodes)
-        self.edge_type = nn.Linear(hidden_dim * 2, 3) # 1->2, 2->1, both directions
-        self.stop = nn.Linear(hidden_dim * 2, 1)
+        self.node_1 = nn.Linear(hidden_dim * 2, hidden_dim)
+        self.node_1_logits = nn.Linear(hidden_dim, max_num_nodes)
+        self.node_2 = nn.Linear(hidden_dim * 2, hidden_dim)
+        self.node_2_logits = nn.Linear(hidden_dim, max_num_nodes)
+        self.edge_type = nn.Linear(hidden_dim * 2, hidden_dim)
+        self.edge_type_logits = nn.Linear(hidden_dim, 3)        
+        self.stop = nn.Linear(hidden_dim * 2, hidden_dim)
+        self.stop_logits = nn.Linear(hidden_dim, 3)
+
+    def set_temperature(self, temperature):
+        self.temperature = temperature
 
     def forward(self, x, edge_index):
         # GCN layers
@@ -27,11 +34,13 @@ class PolicyNetwork(nn.Module):
         x2,_ = torch.max(gcn, dim=0, keepdim=True)  # Pooling node embeddings
         graph_pooling = torch.cat([x1, x2], dim=1)
         # sample node_id1
-        node1_soft = F.gumbel_softmax(self.mask_logits(gcn, edge_index, None, self.node_1(graph_pooling)), tau=self.temperature, hard=False, dim=-1)        
+        node1_logits = F.relu(self.node_1(graph_pooling))
+        node1_soft = F.gumbel_softmax(self.mask_logits(gcn, edge_index, None, self.node_1_logits(node1_logits)), tau=self.temperature, hard=False, dim=-1)        
         node1_idx = torch.argmax(node1_soft, dim=-1)
         
         # logits mask for node_id2. Only allow nodes that have no edges to node_id1
-        node2_logits = self.mask_logits(gcn, edge_index, node1_idx, self.node_2(graph_pooling))
+        node2_logits = F.relu(self.node_2(graph_pooling))
+        node2_logits = self.mask_logits(gcn, edge_index, node1_idx, self.node_2_logits(node2_logits))
         
         # Check if all logits are very small (indicating no valid second node)
         if torch.all(node2_logits <= MASK_VALUE):
@@ -43,9 +52,11 @@ class PolicyNetwork(nn.Module):
         node1_embedding = gcn[node1_idx]
         node2_embedding = gcn[node2_idx]
         node_embeddings = torch.cat([node1_embedding, node2_embedding], dim=1)
-        edge_type_soft = F.gumbel_softmax(self.edge_type(node_embeddings), tau=self.temperature, hard=False, dim=-1)
+        edge_type_logits = F.relu(self.edge_type(node_embeddings))
+        edge_type_soft = F.gumbel_softmax(self.edge_type_logits(edge_type_logits), tau=self.temperature, hard=False, dim=-1)
         # stop signal
-        stop_soft = F.gumbel_softmax(self.stop(graph_pooling), tau=self.temperature, hard=False, dim=-1)
+        stop_logits = F.relu(self.stop(graph_pooling))
+        stop_soft = F.gumbel_softmax(self.stop_logits(stop_logits), tau=self.temperature, hard=False, dim=-1)
         
         return node1_soft, node2_soft, edge_type_soft, stop_soft
     

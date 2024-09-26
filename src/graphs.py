@@ -58,10 +58,12 @@ def create_graph(elements, d_model=POSITIONAL_EMBEDDINGS_DIM):
     elements = [element for element in elements if element[1].strip()]
 
     texts = [element[1] for element in elements]
-    embeddings = get_nvidia_nim_embeddings(texts)
+    embeddings_response = get_nvidia_nim_embeddings(texts)
 
-    for (element, embedding) in zip(elements, embeddings):
+    for (element, embedding_info) in zip(elements, embeddings_response):
         box, text, label, label_id = element
+        embedding = embedding_info['embedding']
+        num_tokens = embedding_info['num_tokens']
         # Convert embedding to tensor if it's not already
         embedding_tensor = torch.tensor(embedding) if not isinstance(embedding, torch.Tensor) else embedding
         pos_embeddings = torch.zeros(d_model*4)  # Initialize pos_embeddings to zeros
@@ -71,7 +73,8 @@ def create_graph(elements, d_model=POSITIONAL_EMBEDDINGS_DIM):
             "embedding": embedding_tensor,
             "label": label,
             "label_id": label_id,
-            "pos_embeddings": pos_embeddings
+            "pos_embeddings": pos_embeddings,
+            "num_tokens": num_tokens
         })
     
     # Create one-hot encoded labels

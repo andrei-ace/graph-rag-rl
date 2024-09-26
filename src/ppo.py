@@ -1,66 +1,129 @@
 from math import sqrt
+import random
 import torch
 import torch.nn.functional as F
 from torch_geometric.data import Data
+from config import EMBEDDINGS_TOKEN_LIMIT
 from models import CriticNetwork, PolicyNetwork
 from rag import rag
 from graphs import find_strongly_connected_components
-import concurrent.futures
+from concurrent.futures import ThreadPoolExecutor
 import os
-from statistics import variance
 
-MAX_STEPS = 128
+MIN_STEPS = 4
+MAX_STEPS = 256
 
 class PPO:
-    def __init__(self, input_dim, shaped_reward_coef=0.1, device="cpu", episodes=10):
-        hidden_dim = 64
+    def __init__(self, input_dim, 
+                 device="cpu", 
+                 episodes=100,
+                 shaped_reward_coef=0.1, 
+                 split=0.5, 
+                 start_temp=5.0, 
+                 end_temp=0.1, 
+                 decay_rate=0.1, 
+                 num_trajectories=8,
+                 epochs=4):
+        hidden_dim = 128
         # Initialize networks
         self.policy_net = PolicyNetwork(input_dim, hidden_dim)
         self.critic_net = CriticNetwork(input_dim, hidden_dim)
-        self.device = torch.device(device)
-        self.shaped_reward_coef = shaped_reward_coef
+        self.device = torch.device(device)        
         self.policy_net.to(self.device)
         self.critic_net.to(self.device)
         # Initialize optimizer
         self.optimizer = torch.optim.Adam(
             list(self.policy_net.parameters())
             + list(self.critic_net.parameters()),
-            lr=1e-3,
+            lr=1e-4,
         )
         # Initialize loss functions for PPO
         self.value_loss_fn = torch.nn.MSELoss()        
         self.episodes = episodes
+        self.shaped_reward_coef = shaped_reward_coef
+        self.split = split
+        self.start_temp = start_temp
+        self.end_temp = end_temp
+        self.decay_rate = decay_rate
+        self.num_trajectories = num_trajectories
+        self.max_workers = min(num_trajectories, os.cpu_count() or 1)
+        self.epochs = epochs
 
-    def calculate_shaped_reward(self, graph):
+    def calculate_shaped_reward(self, graph, nodes, edges):
         num_nodes = graph.num_nodes
-        # Get the strongly connected components
         sccs = find_strongly_connected_components(graph.edge_index, num_nodes)
         scc_len = len(sccs)
-        target_scc = sqrt(num_nodes)
+        target_scc = num_nodes // 2
+        max_tokens_per_scc = EMBEDDINGS_TOKEN_LIMIT
 
-        # Reward for how close the number of SCCs is to the square root of the number of nodes
-        num_scc_reward = 1.0 - abs(scc_len - target_scc) / target_scc
+        def normalize_reward(reward):
+            return 2.0 * (reward - 0.5)  # Normalize to [-1, 1]
 
-        # Reward for low variance in SCC sizes
-        scc_sizes = [len(scc) for scc in sccs]
-        size_variance = variance(scc_sizes) if len(scc_sizes) > 1 else 0
-        max_possible_variance = ((num_nodes - scc_len + 1) ** 2) * (scc_len - 1) / (4 * scc_len)
-        size_variance_reward = 1.0 - (size_variance / max_possible_variance if max_possible_variance > 0 else 0)
+        def calculate_num_scc_reward():
+            reward = 1.0 - abs(scc_len - target_scc) / target_scc
+            return normalize_reward(reward)
 
-        # Penalty for large SCCs
-        avg_scc_size = num_nodes / scc_len
-        large_scc_penalty = sum([len(scc) for scc in sccs if len(scc) > 2 * avg_scc_size]) / num_nodes
+        def calculate_size_variance_reward():
+            scc_sizes = torch.tensor([len(scc) for scc in sccs], dtype=torch.float32, device=self.device)
+            size_variance = torch.var(scc_sizes).item() if len(scc_sizes) > 1 else 0
+            max_possible_variance = ((num_nodes - scc_len + 1) ** 2) * (scc_len - 1) / (4 * scc_len)
+            reward = 1.0 - (size_variance / max_possible_variance if max_possible_variance > 0 else 0)
+            return normalize_reward(reward)
 
-        # Combine the rewards and penalties (you can adjust the weights as needed)
-        reward = 0.4 * num_scc_reward + 0.4 * size_variance_reward - 0.2 * large_scc_penalty
+        def calculate_large_scc_penalty():
+            avg_scc_size = num_nodes / scc_len
+            penalty = sum([len(scc) for scc in sccs if len(scc) > 2 * avg_scc_size]) / num_nodes
+            return normalize_reward(penalty)
+
+        def calculate_degree_balance_reward():
+            degrees = torch.sum(graph.edge_index, dim=1).float()
+            degree_variance = torch.var(degrees).item()
+            max_possible_degree_variance = (num_nodes - 1) * (num_nodes - 1) / 4
+            reward = 1.0 - (degree_variance / max_possible_degree_variance)
+            return normalize_reward(reward)
+
+        # def calculate_token_distribution_reward():
+        #     penalty = 0.0
+        #     scc_token_counts = [sum(nodes[node]["num_tokens"] for node in scc) for scc in sccs]
+        #     for total_tokens in scc_token_counts:
+        #         if total_tokens > max_tokens_per_scc:
+        #             penalty += (total_tokens - max_tokens_per_scc) / max_tokens_per_scc
+            
+        #     # Calculate variance of token counts
+        #     token_variance = torch.var(torch.tensor(scc_token_counts, dtype=torch.float32, device=self.device)).item()
+        #     max_possible_variance = (max_tokens_per_scc ** 2) * (len(sccs) - 1) / len(sccs)
+        #     reward = 1.0 - (token_variance / max_possible_variance if max_possible_variance > 0 else 0)
+            
+        #     net_reward = reward - penalty
+        #     return normalize_reward(net_reward)
+
+        num_scc_reward = calculate_num_scc_reward()
+        size_variance_reward = calculate_size_variance_reward()
+        degree_balance_reward = calculate_degree_balance_reward()
+        # token_limit_penalty = calculate_token_distribution_reward()
+
+        reward = (
+            0.33 * num_scc_reward +
+            0.33 * size_variance_reward +
+            0.33 * degree_balance_reward
+            # 0.50 * token_limit_penalty +
+        )
         return reward
 
-    def evaluate_graph_value(self, graph, nodes, edges, done, questions_answers, episode_num, split=0.5):
-        if questions_answers is None or episode_num < self.episodes * split:
-            score = self.calculate_shaped_reward(graph) * self.shaped_reward_coef
+    def evaluate_graph_value(self, graph, nodes, edges, done, 
+                             questions_answers=None, 
+                             initial_value=0.0, 
+                             episode_num=0):
+        score = 0
+        if episode_num < self.episodes * self.split:
+            score = self.calculate_shaped_reward(graph, nodes, edges) * self.shaped_reward_coef
+            # add the score of the RAG queries to the score
+            if done and questions_answers is not None:
+                results = rag(graph, nodes, edges, questions_answers)
+                score += sum([score for _, _, _, score in results]) / len(results) - initial_value
         else:
             # Only evaluate the score if the episode is done
-            if done:
+            if done and questions_answers is not None:
                 results = rag(graph, nodes, edges, questions_answers)
                 score = sum([score for _, _, _, score in results]) / len(results)
             else:
@@ -83,34 +146,44 @@ class PPO:
                 edges.append((node2_idx, node1_idx))
         return graph, nodes, edges
     
-    def generate_trajectory(self, graph, nodes, edges, questions_answers, episode_num, max_steps=MAX_STEPS):
+    def generate_trajectory(self, graph, nodes, edges, questions_answers, episode_num):
         trajectory = []
         graph = graph.to(self.device)
         self.policy_net.eval()
         self.critic_net.eval()
         with torch.inference_mode():
-            stop_idx = 0
-            current_value = self.evaluate_graph_value(graph, nodes, edges, False, questions_answers, episode_num)
-            for i in range(max_steps):
-                node1_soft, node2_soft, edge_type_soft, stop_soft = self.policy_net(graph.x, graph.edge_index)            
+            starting_value = self.evaluate_graph_value(graph, nodes, edges, False, 
+                                                       questions_answers=questions_answers, 
+                                                       initial_value=0.0, 
+                                                       episode_num=episode_num)
+            current_value = starting_value
+            for i in range(MAX_STEPS):
+                node1_soft, node2_soft, edge_type_soft, stop_soft = self.policy_net(graph.x, graph.edge_index)
+                # if node1 or node 2 are None then we stop
+                if node1_soft is None or node2_soft is None or edge_type_soft is None or stop_soft is None:
+                    break
                 node1_idx = node1_soft.argmax().item()
                 node2_idx = node2_soft.argmax().item()
                 edge_type_idx = edge_type_soft.argmax().item()
                 done = stop_soft.argmax().item()
-                last_step = i == max_steps - 1 or done == 1
-                action_prob = (node1_soft[0][node1_idx] * node2_soft[0][node2_idx] * edge_type_soft[0][edge_type_idx]).item()                                
+                last_step = i == MAX_STEPS - 1 or done == 1
+                action_prob = (node1_soft[0][node1_idx] * node2_soft[0][node2_idx] * edge_type_soft[0][edge_type_idx] * stop_soft[0][0]).item()                                
                 # apply the action
                 graph, nodes, edges = self.modify_graph(graph, nodes, edges, node1_idx, node2_idx, edge_type_idx)
-                value = self.evaluate_graph_value(graph, nodes, edges, last_step, questions_answers, episode_num)
+                value = self.evaluate_graph_value(graph, nodes, edges, last_step, 
+                                                  questions_answers=questions_answers, 
+                                                  initial_value=starting_value, 
+                                                  episode_num=episode_num)
                 reward = value - current_value
                 current_value = value
                 trajectory.append(((node1_idx, node2_idx), edge_type_idx, action_prob, reward, done))
-                if stop_idx == 1:
+                # ignore the stop if steps is less than min_steps
+                if last_step:
                     break
                                 
         return trajectory, graph, nodes, edges
 
-    def compute_advantages_and_returns(self, trajectory, graph, nodes, edges, gamma=0.99, lambda_=0.95):
+    def compute_advantages_and_returns(self, trajectory, graph, nodes, edges, gamma=0.995, lambda_=0.95):
         # Move to device
         graph = graph.to(self.device)
         advantages = []
@@ -154,42 +227,41 @@ class PPO:
 
         return advantages, returns
 
-    def run_episode(self, episode_num, graph, nodes, edges, questions_answers, num_trajectories=4):
+    def run_episode(self, episode_num, graph, nodes, edges, questions_answers, temperature):
+        self.policy_net.set_temperature(temperature)
+        
         # Set networks to evaluation mode for the episode
         self.policy_net.eval()
         self.critic_net.eval()        
-        trajectories = []        
-        advantages_all = []
-        returns_all = []
-        with torch.inference_mode():
-            # starting_fc_score = self.evaluate_value(graph, nodes, edges, questions_answers)
-            for _ in range(num_trajectories):                        
-                new_graph = Data(x=graph.x, edge_index=graph.edge_index.clone())                
-                new_edges = edges.copy()                
-                new_nodes = nodes.copy()
-                trajectory, new_graph, new_nodes, new_edges = self.generate_trajectory(new_graph, new_nodes, new_edges, questions_answers, episode_num)                
-                trajectories.append(trajectory)                
-            
-                # total_reward = sum([step[3] for step in trajectory])
-                # print(f"Total reward: {total_reward:.3f}")
-                # ending_fc_score = self.evaluate_value(new_graph, new_nodes, new_edges, questions_answers)
-                # print(f"Starting FC score: {starting_fc_score:.3f}, Ending FC score: {ending_fc_score:.3f}")
-
-            for trajectory in trajectories:
+        
+        def process_trajectory(_):            
+            with torch.inference_mode():
+                while True:  # Keep generating trajectories until we get one with at least min_steps
+                    new_graph = Data(x=graph.x, edge_index=graph.edge_index.clone())                
+                    new_edges = edges.copy()                
+                    new_nodes = nodes.copy()
+                    trajectory, new_graph, new_nodes, new_edges = self.generate_trajectory(new_graph, new_nodes, new_edges, questions_answers, episode_num)                
+                    
+                    if len(trajectory) >= MIN_STEPS:
+                        break  # Exit the loop if the trajectory has at least min_steps
+                
                 new_graph = Data(x=graph.x, edge_index=graph.edge_index.clone())                
                 new_edges = edges.copy()
                 new_nodes = nodes.copy()
+                
                 advantages, returns = self.compute_advantages_and_returns(trajectory, new_graph, new_nodes, new_edges)
                 advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)                
                 advantages = advantages.tolist()
-                returns = returns.tolist()
-                advantages_all.append(advantages)
-                returns_all.append(returns)
+                
+                return trajectory, advantages, returns.tolist()
 
-        for trajectory, advantages, returns in zip(trajectories, advantages_all, returns_all):
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            results = list(executor.map(process_trajectory, range(self.num_trajectories)))
+
+        for trajectory, advantages, returns in results:
             self.update_policy(trajectory, advantages, returns, graph, nodes, edges)
-        
-    def update_policy(self, trajectory, advantages, returns, graph, nodes, edges, epsilon=0.2, epochs=10):
+
+    def update_policy(self, trajectory, advantages, returns, graph, nodes, edges, epsilon=0.2):
         graph = graph.to(self.device)
         self.policy_net.train()
         self.critic_net.train()
@@ -199,27 +271,35 @@ class PPO:
         advantages = torch.tensor(advantages, dtype=torch.float32, device=self.device)
         returns = torch.tensor(returns, dtype=torch.float32, device=self.device)
 
-        for _ in range(epochs):
+        # Normalize advantages
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+        for _ in range(self.epochs):
             new_log_probs = []
-            new_values = []
+            new_values = []            
 
             current_graph = Data(x=graph.x, edge_index=graph.edge_index.clone()).to(self.device)
+            current_nodes = nodes.copy()
             current_edges = edges.copy()
 
-            for i, ((node1_idx, node2_idx), edge_type_idx, action_prob, _, _) in enumerate(trajectory):
-                node1_soft, node2_soft, edge_type_soft, _ = self.policy_net(current_graph.x, current_graph.edge_index)
-                log_action_prob = torch.log(node1_soft[0][node1_idx] * node2_soft[0][node2_idx] * edge_type_soft[0][edge_type_idx] + 1e-10)
+            for i, ((node1_idx, node2_idx), edge_type_idx, _, _, done) in enumerate(trajectory):
+                node1_soft, node2_soft, edge_type_soft, stop_soft = self.policy_net(current_graph.x, current_graph.edge_index)
+                log_action_prob = torch.log(node1_soft[0][node1_idx] * node2_soft[0][node2_idx] * 
+                                            edge_type_soft[0][edge_type_idx] * stop_soft[0][0] + 1e-10)
                 new_log_probs.append(log_action_prob)
 
                 value_new = self.critic_net(current_graph.x, current_graph.edge_index)
                 new_values.append(value_new)
 
-                current_graph, current_edges, _ = self.modify_graph(current_graph, current_edges, nodes, node1_idx, node2_idx, edge_type_idx)
+                current_graph, current_nodes, current_edges = self.modify_graph(
+                    current_graph, current_nodes, current_edges, node1_idx, node2_idx, edge_type_idx)
 
             new_log_probs = torch.stack(new_log_probs)
             new_values = torch.stack(new_values).squeeze()
 
-            ratio = torch.exp(new_log_probs - old_log_probs)
+            # Combine action and done probabilities
+            combined_log_probs = new_log_probs
+            ratio = torch.exp(combined_log_probs - old_log_probs)
             surr1 = ratio * advantages
             surr2 = torch.clamp(ratio, 1 - epsilon, 1 + epsilon) * advantages
             policy_loss = -torch.min(surr1, surr2).mean()
@@ -235,24 +315,28 @@ class PPO:
         return graph, nodes, edges
     
 
-    def infer_trajectory(self, graph, nodes, edges, max_steps=MAX_STEPS):
+    def infer_trajectory(self, graph, nodes, edges):
+        # Set temperature to 0.1 to make the inference more deterministic
+        self.policy_net.set_temperature(0.1)
         self.policy_net.eval()        
         self.critic_net.eval()
         trajectory = []
         graph = graph.to(self.device)
         with torch.inference_mode():
-            for _ in range(max_steps):
+            for _ in range(MAX_STEPS):
                 node1_soft, node2_soft, edge_type_soft, stop_soft = self.policy_net(graph.x, graph.edge_index)
+                if node1_soft is None or node2_soft is None or edge_type_soft is None or stop_soft is None:
+                    break
                 node1_idx = node1_soft.argmax().item()
                 node2_idx = node2_soft.argmax().item()
                 edge_type_idx = edge_type_soft.argmax().item()
-                done = stop_soft.argmax().item()
-                action_prob = (node1_soft[0][node1_idx] * node2_soft[0][node2_idx] * edge_type_soft[0][edge_type_idx]).item()
+                done = stop_soft.argmax().item()            
                 
                 # Apply the action
                 graph, nodes, edges = self.modify_graph(graph, nodes, edges, node1_idx, node2_idx, edge_type_idx)                
                 
-                trajectory.append(((node1_idx, node2_idx), edge_type_idx, action_prob, 0, done))
+                # we don't need the action probability or reward, so we set them to 0
+                trajectory.append(((node1_idx, node2_idx), edge_type_idx, 0, 0, done))
                 
                 if done == 1:
                     break

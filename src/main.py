@@ -1,3 +1,4 @@
+import math
 import os
 import shutil
 import warnings
@@ -74,13 +75,35 @@ def infer_pdf(pdf_entry, ppo, device=device):
     return mean_score
 
 
-def train_pdf(pdf_entry, ppo, episode_num, device=device):
+def train_pdf(pdf_entry, ppo, episode_num, temperature, device=device):
     (pdf_path, questions_answers) = pdf_entry
     cache_key = os.path.basename(pdf_path)
     merged_graph, merged_nodes, merged_edges, _ = cache_results(cache_key, process_pdf, pdf_path)
     merged_graph = merged_graph.to(device)
-    ppo.run_episode(episode_num, merged_graph, merged_nodes, merged_edges, questions_answers)
+    ppo.run_episode(episode_num, merged_graph, merged_nodes, merged_edges, questions_answers, temperature)
 
+
+def determine_temperature(ppo, episode_num):
+    phase1_length = ppo.episodes * ppo.split / 2
+    phase2_length = ppo.episodes * (1 - ppo.split) / 2
+    phase3_length = ppo.episodes * ppo.split / 2
+    phase4_length = ppo.episodes * (1 - ppo.split) / 2
+
+    if episode_num < phase1_length:
+        # Phase 1: Explore with shaped reward
+        return ppo.start_temp + (ppo.end_temp - ppo.start_temp) * (episode_num / phase1_length)
+    elif episode_num < phase1_length + phase2_length:
+        # Phase 2: Exploit with shaped reward
+        adjusted_episode_num = episode_num - phase1_length
+        return ppo.end_temp * math.exp(-ppo.decay_rate * adjusted_episode_num)
+    elif episode_num < phase1_length + phase2_length + phase3_length:
+        # Phase 3: Explore with real reward
+        adjusted_episode_num = episode_num - (phase1_length + phase2_length)
+        return ppo.start_temp + (ppo.end_temp - ppo.start_temp) * (adjusted_episode_num / phase3_length)
+    else:
+        # Phase 4: Exploit with real reward
+        adjusted_episode_num = episode_num - (phase1_length + phase2_length + phase3_length)
+        return ppo.end_temp * math.exp(-ppo.decay_rate * adjusted_episode_num)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Process PDF with optional caching.")
@@ -106,10 +129,12 @@ if __name__ == "__main__":
     ppo = PPO(input_dim=input_dim, device=device, episodes=EPOCHS)
     pbar = tqdm(range(EPOCHS), desc="Training PPO")
     for episode_num in pbar:
+        temperature = determine_temperature(ppo, episode_num)
         for pdf_entry in PDFS[:-1]:        
-            train_pdf(pdf_entry, ppo, episode_num)        
+            train_pdf(pdf_entry, ppo, episode_num, temperature)
         mean_score_withtrain = infer_pdf(PDFS[-1], ppo)
         pbar.set_postfix({
+            'Temperature': f'{temperature:.4f}',
             'No Train': f'{mean_score_notrain:.4f}',
             'With Train': f'{mean_score_withtrain:.4f}'
         })

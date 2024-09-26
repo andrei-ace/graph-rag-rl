@@ -1,15 +1,14 @@
 import requests
 import json
-from typing import List
+from typing import List, Dict
 
 from config import EMBEDDINGS_URL, EMBEDDINGS_MODEL
 
 def get_nvidia_nim_embeddings(
     texts: List[str],
     model: str = EMBEDDINGS_MODEL,
-    embeddings_url: str = EMBEDDINGS_URL,
-    batch_size: int = 16
-) -> List[List[float]]:
+    embeddings_url: str = EMBEDDINGS_URL
+) -> List[Dict[str, any]]:
     if not embeddings_url:
         raise ValueError("embeddings_url must be provided")
     
@@ -24,11 +23,9 @@ def get_nvidia_nim_embeddings(
     
     all_embeddings = []
     
-    for i in range(0, len(texts), batch_size):
-        batch = texts[i:i+batch_size]
-        
+    for text in texts:
         payload = {
-            "input": batch,
+            "input": [text],
             "model": model,
             "input_type": "query",
             "encoding_format": "float",
@@ -39,8 +36,11 @@ def get_nvidia_nim_embeddings(
         
         if response.status_code == 200:
             result = response.json()
-            batch_embeddings = [item['embedding'] for item in result['data']]
-            all_embeddings.extend(batch_embeddings)
+            item = result['data'][0]
+            all_embeddings.append({
+                "embedding": item['embedding'],
+                "num_tokens": result['usage']['total_tokens']
+            })
         else:
             raise Exception(f"Error getting embeddings: {response.status_code} - {response.text}")
     

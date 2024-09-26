@@ -70,9 +70,9 @@ def rag(graph, nodes, edges, questions_answers):
         txt = extract_text_from_graph(subgraph, nodes, edges)
         texts.append(txt)
 
-    text_embeddings = get_nvidia_nim_embeddings(texts)
+    text_embeddings = [embedding['embedding'] for embedding in get_nvidia_nim_embeddings(texts)]
     questions, answers = zip(*questions_answers)
-    question_embeddings = get_nvidia_nim_embeddings(questions)
+    question_embeddings = [embedding['embedding'] for embedding in get_nvidia_nim_embeddings(questions)]
 
     results = []
     for question, provided_answer, question_embedding in zip(questions, answers, question_embeddings):
