@@ -19,7 +19,7 @@ from rag import rag
 
 device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
 
-EPOCHS = 100
+EPOCHS = 20
 # Define a cache directory
 CACHE_DIR = "__cache__"
 
@@ -129,7 +129,8 @@ if __name__ == "__main__":
     print(f"PyTorch version: {torch.__version__}")
     mean_score_notrain = infer_pdf(PDFS[-1], None)
     print(f"Mean scores no training: {mean_score_notrain:.4f}")
-    input_dim = EMBEDDINGS_SIZE + len(CLASS_NAMES) + 4*POSITIONAL_EMBEDDINGS_DIM    
+    # text embeddings + 1 (num_tokens) + one-hot classes + positional embeddings for bbox
+    input_dim = EMBEDDINGS_SIZE + 1 + len(CLASS_NAMES) + 4*POSITIONAL_EMBEDDINGS_DIM    
     ppo = PPO(input_dim=input_dim, device=device, episodes=EPOCHS)
     pbar = tqdm(range(EPOCHS), desc="Training PPO")
     for episode_num in pbar:

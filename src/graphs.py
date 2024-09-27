@@ -1,10 +1,8 @@
 import torch
 import numpy as np
-import hashlib
 from torch_geometric.data import Data
-from collections import defaultdict, deque
 
-from config import POSITIONAL_EMBEDDINGS_DIM
+from config import POSITIONAL_EMBEDDINGS_DIM, EMBEDDINGS_TOKEN_LIMIT
 from embeddings import get_nvidia_nim_embeddings
 
 def get_sinusoidal_positional_embeddings(bbox, num_rows, num_cols, d_model):
@@ -88,6 +86,7 @@ def create_graph(elements, d_model=POSITIONAL_EMBEDDINGS_DIM):
         torch.cat([
             node["embedding"],
             node_labels[i],  # Use the one-hot encoded label
+            torch.tensor([node["num_tokens"] / EMBEDDINGS_TOKEN_LIMIT], dtype=torch.float32),  # Normalize to (0, 1)
             node["pos_embeddings"]
         ]) for i, node in enumerate(nodes)
     ])

@@ -17,13 +17,13 @@ class PPO:
     def __init__(self, input_dim, 
                  device="cpu", 
                  episodes=100,
-                 shaped_reward_coef=0.1, 
+                 shaped_reward_coef=0.01, 
                  split=0.5, 
-                 start_temp=5.0,
+                 start_temp=2.0,
                  end_temp=0.1, 
                  decay_rate=0.1, 
-                 num_trajectories=8,
-                 epochs=4):
+                 num_trajectories=4,
+                 epochs=10):
         hidden_dim = 128
         # Initialize networks
         self.policy_net = PolicyNetwork(input_dim, hidden_dim)
@@ -53,7 +53,7 @@ class PPO:
         num_nodes = graph.num_nodes
         sccs = find_strongly_connected_components(graph.edge_index, num_nodes)
         scc_len = len(sccs)
-        target_scc = num_nodes // 2
+        target_scc = num_nodes // 4
         max_tokens_per_scc = EMBEDDINGS_TOKEN_LIMIT
 
         def normalize_reward(reward):
@@ -82,31 +82,31 @@ class PPO:
             reward = 1.0 - (degree_variance / max_possible_degree_variance)
             return normalize_reward(reward)
 
-        # def calculate_token_distribution_reward():
-        #     penalty = 0.0
-        #     scc_token_counts = [sum(nodes[node]["num_tokens"] for node in scc) for scc in sccs]
-        #     for total_tokens in scc_token_counts:
-        #         if total_tokens > max_tokens_per_scc:
-        #             penalty += (total_tokens - max_tokens_per_scc) / max_tokens_per_scc
+        def calculate_token_distribution_reward():
+            penalty = 0.0
+            scc_token_counts = [sum(nodes[node]["num_tokens"] for node in scc) for scc in sccs]
+            for total_tokens in scc_token_counts:
+                if total_tokens > max_tokens_per_scc:
+                    penalty += (total_tokens - max_tokens_per_scc) / max_tokens_per_scc
             
-        #     # Calculate variance of token counts
-        #     token_variance = torch.var(torch.tensor(scc_token_counts, dtype=torch.float32, device=self.device)).item()
-        #     max_possible_variance = (max_tokens_per_scc ** 2) * (len(sccs) - 1) / len(sccs)
-        #     reward = 1.0 - (token_variance / max_possible_variance if max_possible_variance > 0 else 0)
+            # Calculate variance of token counts
+            token_variance = torch.var(torch.tensor(scc_token_counts, dtype=torch.float32, device=self.device)).item()
+            max_possible_variance = (max_tokens_per_scc ** 2) * (len(sccs) - 1) / len(sccs)
+            reward = 1.0 - (token_variance / max_possible_variance if max_possible_variance > 0 else 0)
             
-        #     net_reward = reward - penalty
-        #     return normalize_reward(net_reward)
+            net_reward = reward - penalty
+            return normalize_reward(net_reward)
 
         num_scc_reward = calculate_num_scc_reward()
         size_variance_reward = calculate_size_variance_reward()
         degree_balance_reward = calculate_degree_balance_reward()
-        # token_limit_penalty = calculate_token_distribution_reward()
+        token_limit_penalty = calculate_token_distribution_reward()
 
         reward = (
-            0.33 * num_scc_reward +
-            0.33 * size_variance_reward +
-            0.33 * degree_balance_reward
-            # 0.50 * token_limit_penalty +
+            0.25 * num_scc_reward +
+            0.25 * size_variance_reward +
+            0.25 * degree_balance_reward +
+            0.25 * token_limit_penalty
         )
         return reward
 
