@@ -46,7 +46,7 @@ class PPO:
         self.optimizer = torch.optim.Adam(
             list(self.policy_net.parameters())
             + list(self.critic_net.parameters()),
-            lr=1e-6,
+            lr=1e-5,
         )
         # Initialize loss functions for PPO
         self.value_loss_fn = torch.nn.MSELoss()        
@@ -146,12 +146,13 @@ class PPO:
             # + evaluate_node_degree_balance() \
             + evaluate_token_distribution() * 0.5
         )
-        return overall_score * 0.01
+        return overall_score * 0.1
+
 
     def calculate_rag_score(self, graph, nodes, edges, questions_answers):
         results = rag(graph, nodes, edges, questions_answers)
-        return sum([score for _, _, _, score in results]) / len(results)
-        # return 0.0
+        return sum([score for _, _, _, score in results]) / len(results)        
+
 
     def modify_graph(self, graph, nodes, edges, node1_idx, node2_idx, edge_type_idx):        
         match (edge_type_idx):
@@ -166,6 +167,7 @@ class PPO:
                 edges.append((node1_idx, node2_idx))
                 edges.append((node2_idx, node1_idx))
         return graph, nodes, edges
+    
     
     def generate_trajectory(self, graph, nodes, edges, questions_answers, episode_num):
         trajectory = []

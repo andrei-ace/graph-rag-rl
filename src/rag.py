@@ -6,11 +6,47 @@ import json
 import torch
 import math
 
-from config import RANK_MODEL, RANK_URL
+from config import RANK_MODEL, RANK_URL, TOP_K
+
+def rank_answers(question, retrieved_text_list, 
+                 model: str = RANK_MODEL,
+                 url: str = RANK_URL) -> tuple[float, str]:
+    headers = {
+        'accept': 'application/json',
+        'Content-Type': 'application/json'
+    }
+    payload = {
+        "model": model,
+        "query": {"text": question},
+        "passages": [{"text": text} for text in retrieved_text_list],
+        "truncate": "END"
+    }
+
+    response = requests.post(url, headers=headers, data=json.dumps(payload))
+    if response.status_code == 200:
+        results = response.json()
+        # Extract logits for each retrieved text
+        logits = [result['logit'] for result in results['rankings']]
+        
+        # Apply softmax to normalize logits
+        exp_logits = [math.exp(logit) for logit in logits]
+        total = sum(exp_logits)
+        probabilities = [exp_logit / total for exp_logit in exp_logits]
+        
+        # Find the best score and its corresponding text
+        best_score = max(probabilities)
+        best_index = probabilities.index(best_score)
+        best_relevant_text = retrieved_text_list[best_index]
+        
+        return best_score, best_relevant_text  # Return best score and text
+    else:
+        print(f"Error: {response.status_code}")
+        return 0, ""  # Return zero score and empty text in case of error
+
 
 def evaluate_answer(question, retrieved_text, correct_answer, 
                     model: str = RANK_MODEL,
-                    url: str = RANK_URL):
+                    url: str = RANK_URL) -> float:
     headers = {
         'accept': 'application/json',
         'Content-Type': 'application/json'
@@ -48,7 +84,7 @@ def evaluate_answer(question, retrieved_text, correct_answer,
         return 0  # Return 0 similarity in case of error
 
 
-def retrieve_relevant_text(question_embedding, text_embeddings, texts, top_k=1):
+def retrieve_relevant_text(question_embedding, text_embeddings, texts, top_k=1) -> list[str]:
     # Convert question_embedding to a tensor if it's not already
     question_embedding = torch.tensor(question_embedding).unsqueeze(0)
     
@@ -62,7 +98,7 @@ def retrieve_relevant_text(question_embedding, text_embeddings, texts, top_k=1):
     return [texts[idx] for idx in top_k_indices]
 
 
-def rag(graph, nodes, edges, questions_answers):
+def rag(graph, nodes, edges, questions_answers) -> list[tuple[str, str, str, float]]:
     subgraphs = split_graph(graph, nodes, edges)
     # print(f"Found {len(subgraphs)} subgraphs")
     texts = []
@@ -76,15 +112,12 @@ def rag(graph, nodes, edges, questions_answers):
 
     results = []
     for question, provided_answer, question_embedding in zip(questions, answers, question_embeddings):
-        relevant_text_list = retrieve_relevant_text(question_embedding, text_embeddings, texts)
-        scores = []
-        for relevant_text in relevant_text_list:
-            score = evaluate_answer(question, relevant_text, provided_answer)
-            scores.append(score)
-        # Choose the best score
-        best_score = max(scores)
-        best_index = scores.index(best_score)
-        best_relevant_text = relevant_text_list[best_index]
-        results.append((question, provided_answer, best_relevant_text, best_score))
+        relevant_text_list = retrieve_relevant_text(question_embedding, text_embeddings, texts, top_k=TOP_K)
+        # Get the best score and relevant text
+        best_score, best_relevant_text = rank_answers(question, relevant_text_list)
+        
+        score = evaluate_answer(question, best_relevant_text, provided_answer)
+        results.append((question, provided_answer, best_relevant_text, score))
+        
 
     return results

@@ -7,7 +7,7 @@ from tqdm import tqdm
 import joblib  # type: ignore
 import argparse
 
-from config import EMBEDDINGS_SIZE, POSITIONAL_EMBEDDINGS_DIM
+from config import EMBEDDINGS_SIZE, EPOCHS, START_TEMP, END_TEMP, SPLIT, DECAY_RATE, TOP_K, POSITIONAL_EMBEDDINGS_DIM
 from images import convert_pdf_to_images, vertically_append_images
 from detect_layout import CLASS_NAMES, detect_layout_elements
 from ocr import ocr_elements
@@ -18,12 +18,6 @@ from questions import PDFS
 from rag import rag
 
 device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
-
-EPOCHS = 100
-START_TEMP = 2.0
-END_TEMP = 0.1
-SPLIT = 0.25
-DECAY_RATE = 10.0/EPOCHS
 # Define a cache directory
 CACHE_DIR = "__cache__"
 

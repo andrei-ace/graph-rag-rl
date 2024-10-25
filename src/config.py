@@ -9,3 +9,10 @@ RANK_MODEL = os.environ.get('RANK_MODEL', 'nvidia/nv-rerankqa-mistral-4b-v3')
 RANK_URL = os.environ.get('RANK_URL', 'http://localhost:8002/v1/ranking')
 
 POSITIONAL_EMBEDDINGS_DIM = 64
+
+EPOCHS = 100
+START_TEMP = 2.0
+END_TEMP = 0.1
+SPLIT = 0.25
+DECAY_RATE = 10.0/EPOCHS
+TOP_K = 10

@@ -1,6 +1,7 @@
 import matplotlib.pyplot as plt
 import numpy as np
-from main import determine_temperature, EPOCHS
+from main import determine_temperature
+from config import EPOCHS
 
 # Calculate temperature using determine_temperature
 temperature = np.zeros(EPOCHS)
