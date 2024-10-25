@@ -64,7 +64,7 @@ def retrieve_relevant_text(question_embedding, text_embeddings, texts, top_k=1):
 
 def rag(graph, nodes, edges, questions_answers):
     subgraphs = split_graph(graph, nodes, edges)
-    print(f"Found {len(subgraphs)} subgraphs")
+    # print(f"Found {len(subgraphs)} subgraphs")
     texts = []
     for subgraph, nodes, edges in subgraphs:
         txt = extract_text_from_graph(subgraph, nodes, edges)
@@ -76,7 +76,7 @@ def rag(graph, nodes, edges, questions_answers):
 
     results = []
     for question, provided_answer, question_embedding in zip(questions, answers, question_embeddings):
-        relevant_text_list = retrieve_relevant_text(question_embedding, text_embeddings, texts, top_k=10)
+        relevant_text_list = retrieve_relevant_text(question_embedding, text_embeddings, texts)
         scores = []
         for relevant_text in relevant_text_list:
             score = evaluate_answer(question, relevant_text, provided_answer)

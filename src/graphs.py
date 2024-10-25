@@ -151,13 +151,13 @@ def update_coordinates_and_merge_graphs(graphs_nodes_edges, images, d_model=POSI
     merged_graph = Data(x=combined_x, edge_index=combined_edge_index, edge_attr=combined_edge_attr)
 
     # Calculate the sinusoidal positional embeddings for the updated bounding boxes
-    for node, node_x in zip(updated_nodes, combined_x):
-        bbox = node["bbox"]
-        # pos_embeddings is a np array 4 x d_model
-        pos_embeddings = get_sinusoidal_positional_embeddings(bbox, total_height, img.size[0], d_model)
-        node["pos_embeddings"] = torch.tensor(pos_embeddings.flatten())
-        # Update the positional embeddings
-        node_x[-d_model*4:] = node["pos_embeddings"]
+    # for node, node_x in zip(updated_nodes, combined_x):
+    #     bbox = node["bbox"]
+    #     # pos_embeddings is a np array 4 x d_model
+    #     pos_embeddings = get_sinusoidal_positional_embeddings(bbox, total_height, img.size[0], d_model)
+    #     node["pos_embeddings"] = torch.tensor(pos_embeddings.flatten())
+    #     # Update the positional embeddings
+    #     node_x[-d_model*4:] = node["pos_embeddings"]
 
     return merged_graph, updated_nodes, updated_edges
 

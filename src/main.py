@@ -11,7 +11,7 @@ from config import EMBEDDINGS_SIZE, POSITIONAL_EMBEDDINGS_DIM
 from images import convert_pdf_to_images, vertically_append_images
 from detect_layout import CLASS_NAMES, detect_layout_elements
 from ocr import ocr_elements
-from graphs import create_graph, update_coordinates_and_merge_graphs
+from graphs import create_graph, find_strongly_connected_components, update_coordinates_and_merge_graphs
 from ppo import PPO
 from visuals import visualize_graph
 from questions import PDFS
@@ -19,7 +19,11 @@ from rag import rag
 
 device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
 
-EPOCHS = 20
+EPOCHS = 100
+START_TEMP = 2.0
+END_TEMP = 0.1
+SPLIT = 0.25
+DECAY_RATE = 10.0/EPOCHS
 # Define a cache directory
 CACHE_DIR = "__cache__"
 
@@ -64,9 +68,10 @@ def infer_pdf(pdf_entry, ppo, device=device):
         trajectory, merged_graph, merged_nodes, merged_edges = ppo.infer_trajectory(
             merged_graph, merged_nodes, merged_edges
         )
-        print(f"length of trajectory: {len(trajectory)}")
+        strongly_connected_components = find_strongly_connected_components(merged_graph.edge_index, merged_graph.num_nodes)
+        print(f"length of trajectory: {len(trajectory)} num_components: {len(strongly_connected_components)}")
         save_path = "docs/output/with_trainig.png"
-    visualize_graph(merged_image, merged_nodes, merged_edges, save_path=save_path)
+    # visualize_graph(merged_image, merged_nodes, merged_edges, save_path=save_path)
     results = rag(merged_graph, merged_nodes, merged_edges, questions_answers)
     # for question, answer, generated_answer, score in results:
     #     print(f"Question: {question}\nProvided Answer:{answer}\nGenerated Answer: {generated_answer}\nScore: {score:.4f}")
@@ -83,33 +88,35 @@ def train_pdf(pdf_entry, ppo, episode_num, temperature, device=device):
     ppo.run_episode(episode_num, merged_graph, merged_nodes, merged_edges, questions_answers, temperature)
 
 
-def determine_temperature(ppo, episode_num):
-    phase1_length = ppo.episodes * ppo.split / 2
-    phase2_length = ppo.episodes * (1 - ppo.split) / 2
-    phase3_length = ppo.episodes * ppo.split / 2
-    phase4_length = ppo.episodes * (1 - ppo.split) / 2
+def determine_temperature(episode_num):
+    # Adjusted phase lengths
+    phase1_length = EPOCHS * SPLIT / 2
+    phase2_length = EPOCHS * SPLIT / 2
+    phase3_length = EPOCHS * (1 - SPLIT) / 2
+    phase4_length = EPOCHS * (1 - SPLIT) / 2
 
     # Define the intermediate stop point as 2/3 of the distance between start_temp and end_temp
-    intermediate_temp = ppo.end_temp + (ppo.start_temp - ppo.end_temp) * (1 / 3)
+    intermediate_temp = END_TEMP + (START_TEMP - END_TEMP) * (1 / 3)
 
     if episode_num < phase1_length:
         # Phase 1: Explore with shaped reward, stopping at 2/3 point
-        return ppo.start_temp + (intermediate_temp - ppo.start_temp) * (episode_num / phase1_length)
+        return START_TEMP + (intermediate_temp - START_TEMP) * (episode_num / phase1_length)
     elif episode_num < phase1_length + phase2_length:
         # Phase 2: Exploit with shaped reward (exponential decay starting from intermediate point)
         adjusted_episode_num = episode_num - phase1_length
-        return intermediate_temp * math.exp(-ppo.decay_rate * adjusted_episode_num)
+        return intermediate_temp * math.exp(-DECAY_RATE * adjusted_episode_num)
     elif episode_num < phase1_length + phase2_length + phase3_length:
         # Phase 3: Explore with real reward, stopping at 2/3 point
         adjusted_episode_num = episode_num - (phase1_length + phase2_length)
-        return ppo.start_temp + (intermediate_temp - ppo.start_temp) * (adjusted_episode_num / phase3_length)
+        return START_TEMP + (intermediate_temp - START_TEMP) * (adjusted_episode_num / phase3_length)
     else:
         # Phase 4: Exploit with real reward (exponential decay starting from intermediate point)
         adjusted_episode_num = episode_num - (phase1_length + phase2_length + phase3_length)
-        return intermediate_temp * math.exp(-ppo.decay_rate * adjusted_episode_num)
+        return intermediate_temp * math.exp(-DECAY_RATE * adjusted_episode_num)
 
 
 if __name__ == "__main__":
+    PDFS = PDFS[:-1]
     parser = argparse.ArgumentParser(description="Process PDF with optional caching.")
     parser.add_argument("--disable-cache", action="store_true", help="Disable caching of results")
     args = parser.parse_args()
@@ -127,22 +134,23 @@ if __name__ == "__main__":
         print(f"  CUDA device count: {torch.cuda.device_count()}")
         print(f"  CUDA version: {torch.version.cuda}")
     print(f"PyTorch version: {torch.__version__}")
-    mean_score_notrain = infer_pdf(PDFS[-1], None)
-    print(f"Mean scores no training: {mean_score_notrain:.4f}")
-    # text embeddings + 1 (num_tokens) + one-hot classes + positional embeddings for bbox
-    input_dim = EMBEDDINGS_SIZE + 1 + len(CLASS_NAMES) + 4*POSITIONAL_EMBEDDINGS_DIM    
-    ppo = PPO(input_dim=input_dim, device=device, episodes=EPOCHS)
+    mean_score_notrain = sum([infer_pdf(pdf, None) for pdf in PDFS]) / len(PDFS)
+    print(f"Mean scores no training: {mean_score_notrain:.7f}")
+    # text embeddings + one-hot classes + 1 (num_tokens) + positional embeddings for bbox
+    input_dim = EMBEDDINGS_SIZE + len(CLASS_NAMES) + 1 + 4 * POSITIONAL_EMBEDDINGS_DIM    
+    ppo = PPO(input_dim=input_dim, episodes=EPOCHS, device=device, start_temp=START_TEMP, end_temp=END_TEMP, split=SPLIT, decay_rate=DECAY_RATE)
     pbar = tqdm(range(EPOCHS), desc="Training PPO")
     for episode_num in pbar:
-        temperature = determine_temperature(ppo, episode_num)
-        for pdf_entry in PDFS[:-1]:        
+        temperature = determine_temperature(episode_num)
+        for pdf_entry in PDFS:        
             train_pdf(pdf_entry, ppo, episode_num, temperature)
-        mean_score_withtrain = infer_pdf(PDFS[-1], ppo)
+        mean_score_withtrain = sum([infer_pdf(pdf, ppo) for pdf in PDFS]) / len(PDFS)
         pbar.set_postfix({
-            'Temperature': f'{temperature:.4f}',
-            'No Train': f'{mean_score_notrain:.4f}',
-            'With Train': f'{mean_score_withtrain:.4f}'
+            'Temperature': f'{temperature:.7f}',
+            'No Train': f'{mean_score_notrain:.7f}',
+            'With Train': f'{mean_score_withtrain:.7f}',
+            'Improvement': f'{mean_score_withtrain - mean_score_notrain:.7f}'
         })
         print("-" * 100)
-        print(f"Mean scores no training: {mean_score_notrain:.4f} vs with trainig: {mean_score_withtrain:.4f}")
+        print(f"Mean scores no training: {mean_score_notrain:.7f} vs with trainig: {mean_score_withtrain:.7f}")
         print("-" * 100)
