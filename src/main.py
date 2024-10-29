@@ -6,16 +6,20 @@ import torch
 from tqdm import tqdm
 import joblib  # type: ignore
 import argparse
+from torch.utils.tensorboard import SummaryWriter
 
-from config import EMBEDDINGS_SIZE, EPOCHS, START_TEMP, END_TEMP, SPLIT, DECAY_RATE, TOP_K, POSITIONAL_EMBEDDINGS_DIM
+from config import EMBEDDINGS_SIZE, EPOCHS, HIDDEN_DIM, START_TEMP, END_TEMP, SPLIT, DECAY_RATE, TOP_K, POSITIONAL_EMBEDDINGS_DIM
 from images import convert_pdf_to_images, vertically_append_images
 from detect_layout import CLASS_NAMES, detect_layout_elements
 from ocr import ocr_elements
 from graphs import create_graph, find_strongly_connected_components, update_coordinates_and_merge_graphs
-from ppo import PPO
+from ppo import PPO, PPOConfig
 from visuals import visualize_graph
 from questions import PDFS
 from rag import rag
+
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, message="Attempting to run cuBLAS")
 
 device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
 # Define a cache directory
@@ -50,7 +54,9 @@ def process_pdf(pdf_path):
     merged_image = vertically_append_images(images)
     return merged_graph, merged_nodes, merged_edges, merged_image
 
-def infer_pdf(pdf_entry, ppo, device=device):
+def infer_pdf(pdf_entry, ppo, device=device) -> tuple[float, int, int]:
+    scc_count = 0
+    path_length = 0
     (pdf_path, questions_answers) = pdf_entry
     cache_key = os.path.basename(pdf_path)  # or generate a unique key based on pdf_path
     merged_graph, merged_nodes, merged_edges, merged_image = cache_results(cache_key, process_pdf, pdf_path)
@@ -58,11 +64,13 @@ def infer_pdf(pdf_entry, ppo, device=device):
 
     save_path = "docs/output/no_trainig.png"
     if ppo is not None:
-        # This will change the graph in place r
+        # This will change the graph in place
         trajectory, merged_graph, merged_nodes, merged_edges = ppo.infer_trajectory(
             merged_graph, merged_nodes, merged_edges
         )
         strongly_connected_components = find_strongly_connected_components(merged_graph.edge_index, merged_graph.num_nodes)
+        scc_count = len(strongly_connected_components)
+        path_length = len(trajectory)
         print(f"length of trajectory: {len(trajectory)} num_components: {len(strongly_connected_components)}")
         save_path = "docs/output/with_trainig.png"
     # visualize_graph(merged_image, merged_nodes, merged_edges, save_path=save_path)
@@ -71,7 +79,7 @@ def infer_pdf(pdf_entry, ppo, device=device):
     #     print(f"Question: {question}\nProvided Answer:{answer}\nGenerated Answer: {generated_answer}\nScore: {score:.4f}")
     #     print("-" * 100)
     mean_score = sum([score for _, _, _, score in results]) / len(results)
-    return mean_score
+    return mean_score, scc_count, path_length
 
 
 def train_pdf(pdf_entry, ppo, episode_num, temperature, device=device):
@@ -89,8 +97,8 @@ def determine_temperature(episode_num):
     phase3_length = EPOCHS * (1 - SPLIT) / 2
     phase4_length = EPOCHS * (1 - SPLIT) / 2
 
-    # Define the intermediate stop point as 2/3 of the distance between start_temp and end_temp
-    intermediate_temp = END_TEMP + (START_TEMP - END_TEMP) * (1 / 3)
+    # Define the intermediate stop point as 1/4 of the distance between start_temp and end_temp
+    intermediate_temp = END_TEMP + (START_TEMP - END_TEMP) * (3 / 4)
 
     if episode_num < phase1_length:
         # Phase 1: Explore with shaped reward, stopping at 2/3 point
@@ -113,7 +121,9 @@ if __name__ == "__main__":
     PDFS = PDFS[:-1]
     parser = argparse.ArgumentParser(description="Process PDF with optional caching.")
     parser.add_argument("--disable-cache", action="store_true", help="Disable caching of results")
+    parser.add_argument("--continue-from-last-checkpoint", action="store_true", help="Continue training from the last checkpoint")
     args = parser.parse_args()
+    
     if args.disable_cache:
         # delete the cache directory
         shutil.rmtree(CACHE_DIR)
@@ -123,28 +133,62 @@ if __name__ == "__main__":
     print(f"Device type: {device.type}")
     print(f"Device capabilities:")
     print(f"  CUDA available: {torch.cuda.is_available()}")
-    if device.type == 'cuda':
+    if torch.cuda.is_available():
         print(f"  CUDA device name: {torch.cuda.get_device_name(0)}")
         print(f"  CUDA device count: {torch.cuda.device_count()}")
         print(f"  CUDA version: {torch.version.cuda}")
-    print(f"PyTorch version: {torch.__version__}")
-    mean_score_notrain = sum([infer_pdf(pdf, None) for pdf in PDFS]) / len(PDFS)
-    print(f"Mean scores no training: {mean_score_notrain:.7f}")
-    # text embeddings + one-hot classes + 1 (num_tokens) + positional embeddings for bbox
-    input_dim = EMBEDDINGS_SIZE + len(CLASS_NAMES) + 1 + 4 * POSITIONAL_EMBEDDINGS_DIM    
-    ppo = PPO(input_dim=input_dim, episodes=EPOCHS, device=device, start_temp=START_TEMP, end_temp=END_TEMP, split=SPLIT, decay_rate=DECAY_RATE)
-    pbar = tqdm(range(EPOCHS), desc="Training PPO")
-    for episode_num in pbar:
+    print(f"PyTorch version: {torch.__version__}")    
+
+    # Initialize TensorBoard writer
+    writer = SummaryWriter(log_dir="logs")
+
+    # Load last checkpoint if --continue-from-checkpoint is set
+    if args.continue_from_last_checkpoint:
+        checkpoint_dir = "models/checkpoints"
+        ppo = PPO.load_model_checkpoint(checkpoint_dir, device=device)
+        start_episode = ppo.episode_num + 1
+        print(f"Continuing from episode {start_episode-1}")
+    else:
+        # Initialize PPO
+        input_dim = EMBEDDINGS_SIZE + len(CLASS_NAMES) + 1 + 4 * POSITIONAL_EMBEDDINGS_DIM    
+        ppo = PPO.for_training(PPOConfig(input_dim=input_dim, hidden_dim=HIDDEN_DIM), device=device)
+        shutil.rmtree("models/checkpoints", ignore_errors=True)
+        start_episode = 0
+
+    mean_score_notrain = sum([score for score, _, _ in [infer_pdf(pdf, None) for pdf in PDFS]]) / len(PDFS)
+    # print(f"Mean scores no training: {mean_score_notrain:.7f}")
+
+    pbar = tqdm(total=EPOCHS, desc="Training PPO")
+    
+    for episode_num in range(start_episode, EPOCHS):
+        pbar.n = episode_num
+        pbar.refresh()
         temperature = determine_temperature(episode_num)
         for pdf_entry in PDFS:        
             train_pdf(pdf_entry, ppo, episode_num, temperature)
-        mean_score_withtrain = sum([infer_pdf(pdf, ppo) for pdf in PDFS]) / len(PDFS)
+        
+        inferred = [infer_pdf(pdf, ppo) for pdf in PDFS]
+        mean_score_withtrain = sum(score for score, _, _ in inferred) / len(PDFS)
+        mean_scc_count = sum(scc_count for _, scc_count, _ in inferred) / len(PDFS)
+        mean_path_length = sum(path_length for _, _, path_length in inferred) / len(PDFS)
+
+        # Log metrics to TensorBoard
+        writer.add_scalar('Temperature', temperature, episode_num)
+        writer.add_scalar('Mean Score No Train', mean_score_notrain, episode_num)
+        writer.add_scalar('Mean Score With Train', mean_score_withtrain, episode_num)
+        writer.add_scalar('Improvement', mean_score_withtrain - mean_score_notrain, episode_num)
+        writer.add_scalar('Mean SCC Count', mean_scc_count, episode_num)
+        writer.add_scalar('Mean Path Length', mean_path_length, episode_num)
+
         pbar.set_postfix({
             'Temperature': f'{temperature:.7f}',
             'No Train': f'{mean_score_notrain:.7f}',
             'With Train': f'{mean_score_withtrain:.7f}',
-            'Improvement': f'{mean_score_withtrain - mean_score_notrain:.7f}'
+            'Improvement': f'{mean_score_withtrain - mean_score_notrain:.7f}'            
         })
-        print("-" * 100)
-        print(f"Mean scores no training: {mean_score_notrain:.7f} vs with trainig: {mean_score_withtrain:.7f}")
-        print("-" * 100)
+        # save the model
+        ppo.save_model_checkpoint(f"models/checkpoints")
+    
+    ppo.save_model(f"models/final")
+    # Close the TensorBoard writer
+    writer.close()

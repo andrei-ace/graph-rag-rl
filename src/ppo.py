@@ -1,63 +1,200 @@
 import random
 import torch
 from torch_geometric.data import Data
-from config import EMBEDDINGS_TOKEN_LIMIT
+from config import EMBEDDINGS_TOKEN_LIMIT, HIDDEN_DIM, SPLIT, START_TEMP, END_TEMP, DECAY_RATE, EPOCHS
 from models import CriticNetwork, PolicyNetwork
 from rag import rag
 from graphs import find_strongly_connected_components
 from concurrent.futures import ThreadPoolExecutor
 import os
 import numpy as np
+from transformers import PretrainedConfig
+import shutil
 
 MIN_STEPS = 2
 MAX_STEPS = 256
-TRAIN_EPOCHS = 4
-HIDDEN_DIM = 128
-RAG_SKIP_STEPS = 8
+REPEAT_TRAJECTORIES = 8
+TRAJECTORY_TRAIN_EPOCHS = 8
+RAG_SKIP_STEPS = 32
 NUM_TRAJECTORIES = 16
 SAMPLE_SIZE = 8
 
+class PPOConfig(PretrainedConfig):
+    def __init__(self, input_dim=None, hidden_dim=None, **kwargs):
+        super().__init__(**kwargs)
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim    
+        self.gamma = 0.995
+        self.lambda_ = 0.95
+
 class PPO:
     def __init__(self,
-                 input_dim,
-                 episodes=100,
-                 hidden_dim=HIDDEN_DIM,
-                 split=0.5,
-                 start_temp=2.0,
-                 end_temp=0.1,
-                 decay_rate=0.01,
-                 num_trajectories=NUM_TRAJECTORIES,
-                 epochs=TRAIN_EPOCHS,
-                 device="cpu"):
+                 config: PPOConfig,                 
+                 device="cpu"):        
+        self.config = config
+        self.device = torch.device(device)
+
         # Initialize networks
-        self.policy_net = PolicyNetwork(input_dim, hidden_dim)
-        self.critic_net = CriticNetwork(input_dim, hidden_dim)        
-        self.device = torch.device(device)        
+        self.policy_net = PolicyNetwork(config.input_dim, config.hidden_dim)
+        self.critic_net = CriticNetwork(config.input_dim, config.hidden_dim)        
         self.policy_net.to(self.device)
-        self.critic_net.to(self.device)
-        
-        # Initialize weights and biases of the critic network's linear layers to 0
-        # for module in self.critic_net.modules():
-        #     if isinstance(module, torch.nn.Linear):
-        #         torch.nn.init.zeros_(module.weight)
-        #         torch.nn.init.zeros_(module.bias)
+        self.critic_net.to(self.device)                
 
         # Initialize optimizer
         self.optimizer = torch.optim.Adam(
             list(self.policy_net.parameters())
             + list(self.critic_net.parameters()),
-            lr=1e-5,
+            lr=1e-6,
         )
         # Initialize loss functions for PPO
         self.value_loss_fn = torch.nn.MSELoss()        
-        self.episodes = episodes
-        self.split = split
-        self.start_temp = start_temp
-        self.end_temp = end_temp
-        self.decay_rate = decay_rate
-        self.num_trajectories = num_trajectories
-        self.max_workers = min(num_trajectories, os.cpu_count() or 1)
-        self.epochs = epochs
+        self.gamma = config.gamma
+        self.lambda_ = config.lambda_
+        
+        self.episodes = EPOCHS
+        self.episode_num = 0
+        self.split = SPLIT
+        self.start_temp = START_TEMP
+        self.end_temp = END_TEMP
+        self.decay_rate = DECAY_RATE
+        self.num_trajectories = NUM_TRAJECTORIES
+        self.max_workers = min(self.num_trajectories, os.cpu_count() or 1)        
+
+    @classmethod
+    def from_pretrained(cls, path, config: PPOConfig, device="cpu"):
+        """Initialize PPO with pre-trained weights."""
+        instance = cls(config, device)
+        instance.policy_net = PolicyNetwork.from_pretrained(path)
+        instance.critic_net = CriticNetwork.from_pretrained(path)
+        instance.optimizer.load_state_dict(torch.load(os.path.join(path, 'optimizer.pt'), map_location=device))
+        print(f"Model loaded from {path}")
+        return instance
+    
+    @classmethod
+    def for_training(cls, config: PPOConfig, device="cpu"):
+        """Initialize PPO for training with new weights."""
+        return cls(config, device)
+    
+    def save_model(self, path):
+        """Save the model parameters and configuration to the specified path using Hugging Face."""
+        os.makedirs(path, exist_ok=True)
+        
+        # Save the policy network state_dict
+        torch.save(self.policy_net.state_dict(), os.path.join(path, 'policy_net.bin'))
+        
+        # Save the critic network state_dict
+        torch.save(self.critic_net.state_dict(), os.path.join(path, 'critic_net.bin'))
+        
+        # Save the optimizer state
+        torch.save(self.optimizer.state_dict(), os.path.join(path, 'optimizer.pt'))
+        
+        # Save the configuration
+        self.config.save_pretrained(path)
+        
+        print(f"Model and configuration saved to {path}")
+
+    @classmethod
+    def load_model(cls, path, device="cpu"):
+        # Load the configuration
+        config = PPOConfig.from_pretrained(path)
+        
+        # Create an instance of the class
+        instance = cls(config, device)
+        
+        # Load the policy network state_dict
+        instance.policy_net.load_state_dict(torch.load(os.path.join(path, 'policy_net.bin'), map_location=instance.device))
+        instance.policy_net.to(instance.device)  # Move to device
+        
+        # Load the critic network state_dict
+        instance.critic_net.load_state_dict(torch.load(os.path.join(path, 'critic_net.bin'), map_location=instance.device))
+        instance.critic_net.to(instance.device)  # Move to device
+        
+        # Load the optimizer state
+        instance.optimizer.load_state_dict(torch.load(os.path.join(path, 'optimizer.pt'), map_location=instance.device))
+        
+        print(f"Model and configuration loaded from {path}")
+        return instance
+
+    def save_model_checkpoint(self, path_to_checkpoint_dir, additional_params=None, keep_last_k=3):        
+                
+        cleanup_old_checkpoints(path_to_checkpoint_dir, keep_last_k)
+        
+        path = os.path.join(path_to_checkpoint_dir, f'checkpoint_{self.episode_num}')
+        """Save the model parameters, configuration, and additional parameters to the specified path."""
+        os.makedirs(path, exist_ok=True)
+        
+        # Save the policy network state_dict
+        torch.save(self.policy_net.state_dict(), os.path.join(path, 'policy_net.bin'))
+        
+        # Save the critic network state_dict
+        torch.save(self.critic_net.state_dict(), os.path.join(path, 'critic_net.bin'))
+        
+        # Save the optimizer state
+        torch.save(self.optimizer.state_dict(), os.path.join(path, 'optimizer.pt'))
+        
+        # Save the configuration
+        self.config.save_pretrained(path)
+        
+        # Save additional parameters
+        checkpoint = {            
+            'episodes': self.episodes,
+            'episode_num': self.episode_num,
+            'split': self.split,
+            'temperature': self.start_temp,
+            'start_temp': self.start_temp,
+            'end_temp': self.end_temp,
+            'decay_rate': self.decay_rate,
+            # Add any other parameters you want to save
+        }
+        if additional_params:
+            checkpoint.update(additional_params)
+        
+        torch.save(checkpoint, os.path.join(path, 'additional_params.pt'))        
+
+    @classmethod
+    def load_model_checkpoint(cls, path, device="cpu"):
+        if not os.path.exists(path):
+            print(f"Checkpoint directory {path} does not exist")
+            return
+        # find the latest checkpoint
+        checkpoint_files = [
+            f for f in os.listdir(path)
+            if f.startswith('checkpoint_') and f.split('_')[-1].isdigit() and os.path.isdir(os.path.join(path, f))
+        ]
+        checkpoint_files.sort(key=lambda x: int(x.split('_')[-1]))
+        latest_checkpoint = checkpoint_files[-1]
+        path = os.path.join(path, latest_checkpoint)
+        print(f"Loading checkpoint from {path}")
+        """Load the model parameters, configuration, and additional parameters from the specified path."""
+        # Load the configuration
+        config = PPOConfig.from_pretrained(path)
+        
+        # Initialize networks with the loaded configuration
+        instance = cls(config, device=device)
+        instance.policy_net = PolicyNetwork(config.input_dim, config.hidden_dim)
+        instance.critic_net = CriticNetwork(config.input_dim, config.hidden_dim)
+        
+        # Load the policy network state_dict
+        instance.policy_net.load_state_dict(torch.load(os.path.join(path, 'policy_net.bin'), map_location=device))
+        instance.policy_net.to(device)  # Move to device
+        
+        # Load the critic network state_dict
+        instance.critic_net.load_state_dict(torch.load(os.path.join(path, 'critic_net.bin'), map_location=device))
+        instance.critic_net.to(device)  # Move to device
+        
+        # Load the optimizer state
+        instance.optimizer.load_state_dict(torch.load(os.path.join(path, 'optimizer.pt'), map_location=device))
+        
+        # Load additional parameters
+        checkpoint = torch.load(os.path.join(path, 'additional_params.pt'), map_location=device)
+        instance.start_temp = checkpoint.get('temperature', instance.start_temp)
+        instance.episodes = checkpoint.get('episodes', instance.episodes)
+        instance.episode_num = checkpoint.get('episode_num', instance.episode_num)
+        instance.split = checkpoint.get('split', instance.split)
+        instance.start_temp = checkpoint.get('start_temp', instance.start_temp)
+        instance.end_temp = checkpoint.get('end_temp', instance.end_temp)
+        instance.decay_rate = checkpoint.get('decay_rate', instance.decay_rate)        
+        return instance
 
     def max_steps_for_episode(self, episode_num):
         if episode_num < self.episodes * self.split:
@@ -75,61 +212,16 @@ class PPO:
         target_num_components = num_nodes // 2
         target_num_edges = MAX_STEPS // 2
         max_tokens_per_component = EMBEDDINGS_TOKEN_LIMIT
-
-        # def normalize_distribution(values):
-        #     values = np.array(values)
-        #     return (values - np.mean(values)) / (np.std(values) + 1e-8)
-
-        # def kl_divergence_to_normal(values):
-        #     if len(values) < 2:
-        #         return 0  # Return 0 similarity for single-value distributions
-
-        #     normalized_values = normalize_distribution(values)
-            
-        #     # Check if all values are the same (resulting in zero standard deviation)
-        #     if np.all(normalized_values == normalized_values[0]):
-        #         return 0  # Return 0 similarity for uniform distributions
-            
-        #     # Fit a normal distribution to the data
-        #     mu, std = stats.norm.fit(normalized_values)
-            
-        #     # Calculate KL divergence
-        #     hist, bin_edges = np.histogram(normalized_values, bins='auto', density=True)
-        #     bin_midpoints = (bin_edges[1:] + bin_edges[:-1]) / 2
-            
-        #     pdf_observed = hist
-        #     pdf_normal = stats.norm.pdf(bin_midpoints, mu, std)
-            
-        #     # Add small epsilon to avoid division by zero
-        #     epsilon = 1e-10
-        #     pdf_observed = pdf_observed + epsilon
-        #     pdf_normal = pdf_normal + epsilon
-            
-        #     kl_div = np.sum(pdf_observed * np.log(pdf_observed / pdf_normal))
-            
-        #     # Convert KL divergence to a similarity score (lower is better, so we invert)
-        #     similarity = 1 / (1 + kl_div)
-        #     return similarity
-
         def evaluate_num_edges():
             return 1.0 - abs(len(edges) - target_num_edges) / target_num_edges
 
         def evaluate_component_count():
-            return 1.0 - abs(num_components - target_num_components) / target_num_components
-
-        # def evaluate_size_distribution():
-        #     component_sizes = [len(component) for component in strongly_connected_components]
-        #     return kl_divergence_to_normal(component_sizes)
-
-        # def evaluate_node_degree_balance():
-        #     node_degrees = torch.sum(graph.edge_index, dim=1).float().cpu().numpy()
-        #     return kl_divergence_to_normal(node_degrees)            
+            return 1.0 - abs(num_components - target_num_components) / target_num_components        
 
         def evaluate_token_distribution():
             # Calculate the number of tokens in each strongly connected component
             component_token_counts = [sum(nodes[node]["num_tokens"] for node in component) 
-                                      for component in strongly_connected_components]
-            
+                                      for component in strongly_connected_components]            
             # Calculate a penalty for components exceeding the max token limit
             return -np.mean(
                 np.clip(
@@ -140,13 +232,11 @@ class PPO:
             )
 
         overall_score = (
-            evaluate_component_count() * 0.4 \
-            + evaluate_num_edges() * 0.1 \
-            # + evaluate_size_distribution() \
-            # + evaluate_node_degree_balance() \
-            + evaluate_token_distribution() * 0.5
+            evaluate_component_count() * 0.1 +
+            evaluate_num_edges() * 0.1 +              
+            evaluate_token_distribution() * 0.8
         )
-        return overall_score * 0.1
+        return overall_score
 
 
     def calculate_rag_score(self, graph, nodes, edges, questions_answers):
@@ -168,8 +258,8 @@ class PPO:
                 edges.append((node2_idx, node1_idx))
         return graph, nodes, edges
     
-    
-    def generate_trajectory(self, graph, nodes, edges, questions_answers, episode_num):
+
+    def generate_trajectory(self, graph, nodes, edges, questions_answers, episode_num, starting_value_rag=None):
         trajectory = []
         improvement = None
         graph = Data(x=graph.x, edge_index=graph.edge_index.clone())
@@ -180,11 +270,13 @@ class PPO:
         self.critic_net.eval()
         with torch.inference_mode():
                         
-            starting_value = self.calculate_shaped_reward(graph, nodes, edges) # if episode_num < self.episodes * self.split else 0.0
+            starting_value = self.calculate_shaped_reward(graph, nodes, edges) if episode_num < self.episodes * self.split else 0.0
             current_value = starting_value
-            starting_value_rag = self.calculate_rag_score(graph, nodes, edges, questions_answers)
+            if starting_value_rag is None:
+                starting_value_rag = self.calculate_rag_score(graph, nodes, edges, questions_answers)
             current_rag_score = starting_value_rag
             rag_score = None
+            value = None
 
             max_steps = self.max_steps_for_episode(episode_num)
             for i in range(max_steps):
@@ -217,9 +309,13 @@ class PPO:
                     # apply the action
                     graph, nodes, edges = self.modify_graph(graph, nodes, edges, node1_idx, node2_idx, edge_type_idx)                
                 
-                value = self.calculate_shaped_reward(graph, nodes, edges) # if episode_num < self.episodes * self.split else 0.0
-                if i>0 and (episode_num >= self.episodes * self.split) and (last_step or i%RAG_SKIP_STEPS==0):
-                    rag_score = self.calculate_rag_score(graph, nodes, edges, questions_answers)
+                if value is None:
+                    value = starting_value
+                else:
+                    value = self.calculate_shaped_reward(graph, nodes, edges) if episode_num < self.episodes * self.split else 0.0
+                if i>0 and (last_step or i%RAG_SKIP_STEPS==0): # and (episode_num >= self.episodes * self.split):
+                    if rag_score is None:
+                        rag_score = self.calculate_rag_score(graph, nodes, edges, questions_answers)
                     value += rag_score - current_rag_score
                     current_rag_score = rag_score
                                 
@@ -247,7 +343,7 @@ class PPO:
         return improvement, trajectory
 
     # this must be run inside torch.inference_mode()
-    def compute_advantages_and_returns(self, trajectory, graph, nodes, edges, gamma=0.995, lambda_=0.95):
+    def compute_advantages_and_returns(self, trajectory, graph, nodes, edges):
         graph = Data(x=graph.x, edge_index=graph.edge_index.clone())
         graph = graph.to(self.device)
         edges = edges.copy()
@@ -277,8 +373,8 @@ class PPO:
             
             next_value = final_value if t == len(trajectory) - 1 else values[t + 1]
             
-            delta = reward + gamma * next_value * (1 - done) - values[t]
-            gae = delta + gamma * lambda_ * gae * (1 - done)
+            delta = reward + self.gamma * next_value * (1 - done) - values[t]
+            gae = delta + self.gamma * self.lambda_ * gae * (1 - done)
             
             returns.insert(0, gae + values[t])
             advantages.insert(0, gae)        
@@ -288,17 +384,21 @@ class PPO:
         return advantages, returns
 
     def run_episode(self, episode_num, graph, nodes, edges, questions_answers, temperature):
+        self.episode_num = episode_num
         self.policy_net.set_temperature(temperature)
         
         # Set networks to evaluation mode for the episode
         self.policy_net.eval()
         self.critic_net.eval()        
+
+        with torch.inference_mode():
+            starting_value_rag = self.calculate_rag_score(graph, nodes, edges, questions_answers)
         
-        def process_trajectory(_):            
-            with torch.inference_mode():
+        def process_trajectory(_):                        
+            with torch.inference_mode():    
                 while True:  # Keep generating trajectories until we get one with at least min_steps                    
                     improvement, trajectory = self.generate_trajectory(
-                        graph, nodes, edges, questions_answers, episode_num)                
+                        graph, nodes, edges, questions_answers, episode_num, starting_value_rag)                
                     
                     if len(trajectory) >= MIN_STEPS:
                         break  # Exit the loop if the trajectory has at least min_steps                
@@ -320,7 +420,7 @@ class PPO:
             improvement_sum += improvement            
                 
         print(f"Starting training for {len(results)} trajectories, average RAG improvement: {improvement_sum / len(results):.7f}...")        
-        for _ in range(TRAIN_EPOCHS):
+        for _ in range(REPEAT_TRAJECTORIES):
             random.shuffle(results)
             for improvement, trajectory, advantages, returns in results:                
                 self.update_policy(trajectory, advantages, returns, graph, nodes, edges)
@@ -340,7 +440,7 @@ class PPO:
         # Normalize advantages
         # advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
                 
-        for epoch in range(self.epochs):
+        for epoch in range(TRAJECTORY_TRAIN_EPOCHS):
             self.optimizer.zero_grad()
             new_log_probs = []
             new_values = []            
@@ -386,12 +486,8 @@ class PPO:
             total_loss = policy_loss + 0.1 * value_loss
             
             total_loss.backward()
-            # torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), max_norm=0.5)
-            # torch.nn.utils.clip_grad_norm_(self.critic_net.parameters(), max_norm=0.5)
             self.optimizer.step()
-
-            # print(f"Epoch {epoch+1:2d}/{self.epochs:2d}, Policy loss: {policy_loss.item():.9f}, Value loss: {value_loss.item():.9f}, Total loss: {total_loss.item():.9f}")
-
+            
         return graph, nodes, edges
     
 
@@ -413,30 +509,36 @@ class PPO:
                 node1_idx = node1_soft.argmax().item()
                 node2_idx = node2_soft.argmax().item()
                 edge_type_idx = edge_type_soft.argmax().item()
-                done = stop_soft.argmax().item()            
-                
+                done = stop_soft.argmax().item()                            
                 # Apply the action
-                graph, nodes, edges = self.modify_graph(graph, nodes, edges, node1_idx, node2_idx, edge_type_idx)                
-                
+                graph, nodes, edges = self.modify_graph(graph, nodes, edges, node1_idx, node2_idx, edge_type_idx)                                
                 # we don't need the action probability or reward, so we set them to 0
-                trajectory.append(((node1_idx, node2_idx), edge_type_idx, 0, 0, done))
-                
+                trajectory.append(((node1_idx, node2_idx), edge_type_idx, 0, 0, done))                
                 if done == 1:
                     break
-
         return trajectory, graph, nodes, edges    
-
 
 def normalize_advantages(results):
     all_advantages = np.concatenate([adv for _, _, adv, _ in results])
-    std = np.std(all_advantages)
-    
+    std = np.std(all_advantages)    
     normalized_results = []
     for improvement, trajectory, advantages, returns in results:
         # Normalize by dividing by std, preserving sign and keeping 0.0 at 0.0
         normalized_advantages = advantages / (std + 1e-8)
-        normalized_results.append((improvement, trajectory, normalized_advantages, returns))
-    
+        normalized_results.append((improvement, trajectory, normalized_advantages, returns))            
     return normalized_results
 
 
+def cleanup_old_checkpoints(path_to_checkpoint_dir, keep_last_k):
+    if not os.path.exists(path_to_checkpoint_dir):
+        return    
+    # List all files in the directory that match the checkpoint pattern
+    checkpoint_files = [
+        f for f in os.listdir(path_to_checkpoint_dir)
+        if f.startswith('checkpoint_') and f.split('_')[-1].isdigit() and os.path.isdir(os.path.join(path_to_checkpoint_dir, f))
+    ]    
+    # Sort the files based on the numeric suffix
+    checkpoint_files.sort(key=lambda x: int(x.split('_')[-1]))        
+    # Remove old checkpoints if there are more than keep_last_k
+    while len(checkpoint_files) >= keep_last_k:
+        shutil.rmtree(os.path.join(path_to_checkpoint_dir, checkpoint_files.pop(0)))

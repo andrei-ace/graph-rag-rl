@@ -3,8 +3,10 @@ git+https://github.com/THU-MIG/yolov10.git
 
 # Other dependencies
 torch
+torch-tb-profiler
 accelerate
 torch_geometric
+tensorboard
 transformers
 ultralytics
 matplotlib

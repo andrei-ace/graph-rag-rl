@@ -1,4 +1,4 @@
-from torch.nn.functional import cosine_similarity
+from torch.nn.functional import cosine_similarity, softmax
 from graphs import extract_text_from_graph, split_graph
 from embeddings import get_nvidia_nim_embeddings
 import requests
@@ -67,13 +67,12 @@ def evaluate_answer(question, retrieved_text, correct_answer,
         retrieved_logit = results['rankings'][0]['logit']
         correct_logit = results['rankings'][1]['logit']
         
-        # Apply softmax to normalize logits
-        exp_retrieved = math.exp(retrieved_logit)
-        exp_correct = math.exp(correct_logit)
-        total = exp_retrieved + exp_correct
+        # Use softmax to normalize logits
+        logits = torch.tensor([retrieved_logit, correct_logit])
+        probabilities = softmax(logits, dim=0)
         
-        retrieved_prob = exp_retrieved / total
-        correct_prob = exp_correct / total
+        retrieved_prob = probabilities[0].item()
+        correct_prob = probabilities[1].item()
         
         # Calculate similarity based on normalized probabilities
         similarity = 1 - abs(retrieved_prob - correct_prob)

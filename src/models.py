@@ -15,28 +15,28 @@ class PolicyNetwork(nn.Module):
         self.gcn3 = GATConv(hidden_dim * 8, hidden_dim, heads=8)
         self.gcn4 = GATConv(hidden_dim * 8, hidden_dim, heads=8)        
         self.gcn5 = GATConv(hidden_dim * 8, hidden_dim, heads=1)
-        self.node_1_1 = nn.Linear(hidden_dim * 2, hidden_dim)
-        self.node_1_2 = nn.Linear(hidden_dim, hidden_dim)
-        self.node_1_3 = nn.Linear(hidden_dim, hidden_dim)
-        self.node_1_4 = nn.Linear(hidden_dim, hidden_dim)
+        self.node_1_1 = nn.Linear(hidden_dim * 3, hidden_dim)
+        # self.node_1_2 = nn.Linear(hidden_dim, hidden_dim)
+        # self.node_1_3 = nn.Linear(hidden_dim, hidden_dim)
+        # self.node_1_4 = nn.Linear(hidden_dim, hidden_dim)
         self.node_1_5 = nn.Linear(hidden_dim, hidden_dim)
         self.node_1_logits = nn.Linear(hidden_dim, max_num_nodes)
-        self.node_2_1 = nn.Linear(hidden_dim * 2, hidden_dim)
-        self.node_2_2 = nn.Linear(hidden_dim, hidden_dim)
-        self.node_2_3 = nn.Linear(hidden_dim, hidden_dim)
-        self.node_2_4 = nn.Linear(hidden_dim, hidden_dim)
+        self.node_2_1 = nn.Linear(hidden_dim * 3, hidden_dim)
+        # self.node_2_2 = nn.Linear(hidden_dim, hidden_dim)
+        # self.node_2_3 = nn.Linear(hidden_dim, hidden_dim)
+        # self.node_2_4 = nn.Linear(hidden_dim, hidden_dim)
         self.node_2_5 = nn.Linear(hidden_dim, hidden_dim)
         self.node_2_logits = nn.Linear(hidden_dim, max_num_nodes)
-        self.edge_type_1 = nn.Linear(hidden_dim * 2, hidden_dim)
-        self.edge_type_2 = nn.Linear(hidden_dim, hidden_dim)
-        self.edge_type_3 = nn.Linear(hidden_dim, hidden_dim)
-        self.edge_type_4 = nn.Linear(hidden_dim, hidden_dim)
+        self.edge_type_1 = nn.Linear(hidden_dim * 5, hidden_dim)
+        # self.edge_type_2 = nn.Linear(hidden_dim, hidden_dim)
+        # self.edge_type_3 = nn.Linear(hidden_dim, hidden_dim)
+        # self.edge_type_4 = nn.Linear(hidden_dim, hidden_dim)
         self.edge_type_5 = nn.Linear(hidden_dim, hidden_dim)
         self.edge_type_logits = nn.Linear(hidden_dim, 3)
-        self.stop_1 = nn.Linear(hidden_dim * 2, hidden_dim)
-        self.stop_2 = nn.Linear(hidden_dim, hidden_dim)
-        self.stop_3 = nn.Linear(hidden_dim, hidden_dim)
-        self.stop_4 = nn.Linear(hidden_dim, hidden_dim)
+        self.stop_1 = nn.Linear(hidden_dim * 3, hidden_dim)
+        # self.stop_2 = nn.Linear(hidden_dim, hidden_dim)
+        # self.stop_3 = nn.Linear(hidden_dim, hidden_dim)
+        # self.stop_4 = nn.Linear(hidden_dim, hidden_dim)
         self.stop_5 = nn.Linear(hidden_dim, hidden_dim)
         self.stop_logits = nn.Linear(hidden_dim, 2)
 
@@ -50,16 +50,17 @@ class PolicyNetwork(nn.Module):
         x = F.leaky_relu(self.gcn3(x, edge_index))
         x = F.leaky_relu(self.gcn4(x, edge_index))
         gcn = F.leaky_relu(self.gcn5(x, edge_index))
-        x1 = torch.mean(gcn, dim=0, keepdim=True)  # Pooling node embeddings
-        x2,_ = torch.max(gcn, dim=0, keepdim=True)  # Pooling node embeddings
-        graph_pooling = torch.cat([x1, x2], dim=1)
+        x1,_ = torch.min(gcn, dim=0, keepdim=True)  # Pooling node embeddings
+        x2 = torch.mean(gcn, dim=0, keepdim=True)  # Pooling node embeddings
+        x3,_ = torch.max(gcn, dim=0, keepdim=True)  # Pooling node embeddings
+        graph_pooling = torch.cat([x1, x2, x3], dim=1)
         # sample node_id1                
         node1 = F.leaky_relu(self.node_1_1(graph_pooling))
-        shortcut = node1
-        node1 = F.leaky_relu(self.node_1_2(node1))
-        node1 = F.leaky_relu(self.node_1_3(node1))
-        node1 = F.leaky_relu(self.node_1_4(node1))
-        node1 = F.leaky_relu(self.node_1_5(node1 + shortcut))
+        # shortcut = node1
+        # node1 = F.leaky_relu(self.node_1_2(node1))
+        # node1 = F.leaky_relu(self.node_1_3(node1))
+        # node1 = F.leaky_relu(self.node_1_4(node1))
+        node1 = F.leaky_relu(self.node_1_5(node1))
         node1_logits = F.leaky_relu(self.node_1_logits(node1))
         node1_logits = self.mask_logits(gcn, edge_index, None, node1_logits)
 
@@ -68,11 +69,11 @@ class PolicyNetwork(nn.Module):
         
         # logits mask for node_id2. Only allow nodes that have no edges to node_id1
         node2 = F.leaky_relu(self.node_2_1(graph_pooling))
-        shortcut = node2
-        node2 = F.leaky_relu(self.node_2_2(node2))
-        node2 = F.leaky_relu(self.node_2_3(node2))
-        node2 = F.leaky_relu(self.node_2_4(node2))
-        node2 = F.leaky_relu(self.node_2_5(node2 + shortcut))
+        # shortcut = node2
+        # node2 = F.leaky_relu(self.node_2_2(node2))
+        # node2 = F.leaky_relu(self.node_2_3(node2))
+        # node2 = F.leaky_relu(self.node_2_4(node2))
+        node2 = F.leaky_relu(self.node_2_5(node2))
         node2_logits = F.leaky_relu(self.node_2_logits(node2))
         node2_logits = self.mask_logits(gcn, edge_index, node1_idx, node2_logits)
         
@@ -85,22 +86,22 @@ class PolicyNetwork(nn.Module):
         
         node1_embedding = gcn[node1_idx]
         node2_embedding = gcn[node2_idx]
-        node_embeddings = torch.cat([node1_embedding, node2_embedding], dim=1)
+        node_embeddings = torch.cat([x1, x2, x3, node1_embedding, node2_embedding], dim=1)
         edge_type = F.leaky_relu(self.edge_type_1(node_embeddings))
-        shortcut = edge_type    
-        edge_type = F.leaky_relu(self.edge_type_2(edge_type))
-        edge_type = F.leaky_relu(self.edge_type_3(edge_type))
-        edge_type = F.leaky_relu(self.edge_type_4(edge_type))
-        edge_type = F.leaky_relu(self.edge_type_5(edge_type + shortcut))
+        # shortcut = edge_type    
+        # edge_type = F.leaky_relu(self.edge_type_2(edge_type))
+        # edge_type = F.leaky_relu(self.edge_type_3(edge_type))
+        # edge_type = F.leaky_relu(self.edge_type_4(edge_type))
+        edge_type = F.leaky_relu(self.edge_type_5(edge_type))
         edge_type_logits = F.leaky_relu(self.edge_type_logits(edge_type))
         edge_type_soft = F.gumbel_softmax(edge_type_logits, tau=self.temperature, hard=False, dim=-1)
         # stop signal
         stop = F.leaky_relu(self.stop_1(graph_pooling))
-        shortcut = stop 
-        stop = F.leaky_relu(self.stop_2(stop))
-        stop = F.leaky_relu(self.stop_3(stop))
-        stop = F.leaky_relu(self.stop_4(stop))
-        stop = F.leaky_relu(self.stop_5(stop + shortcut))
+        # shortcut = stop 
+        # stop = F.leaky_relu(self.stop_2(stop))
+        # stop = F.leaky_relu(self.stop_3(stop))
+        # stop = F.leaky_relu(self.stop_4(stop))
+        stop = F.leaky_relu(self.stop_5(stop))
         stop_logits = F.leaky_relu(self.stop_logits(stop))
         stop_soft = F.gumbel_softmax(stop_logits, tau=self.temperature, hard=False, dim=-1)        
         
@@ -128,10 +129,10 @@ class CriticNetwork(nn.Module):
         self.gcn3 = GATConv(hidden_dim * 8, hidden_dim, heads=8)
         self.gcn4 = GATConv(hidden_dim * 8, hidden_dim, heads=8)
         self.gcn5 = GATConv(hidden_dim * 8, hidden_dim, heads=1)
-        self.fc1 = nn.Linear(hidden_dim * 2, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-        self.fc3 = nn.Linear(hidden_dim, hidden_dim)
-        self.fc4 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc1 = nn.Linear(hidden_dim * 3, hidden_dim)
+        # self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        # self.fc3 = nn.Linear(hidden_dim, hidden_dim)
+        # self.fc4 = nn.Linear(hidden_dim, hidden_dim)
         self.fc5 = nn.Linear(hidden_dim, 1)
 
     def forward(self, x, edge_index):
@@ -140,13 +141,14 @@ class CriticNetwork(nn.Module):
         x = F.leaky_relu(self.gcn3(x, edge_index))
         x = F.leaky_relu(self.gcn4(x, edge_index))
         gcn = F.leaky_relu(self.gcn5(x, edge_index))
-        x1 = torch.mean(gcn, dim=0, keepdim=True)
-        x2,_ = torch.max(gcn, dim=0, keepdim=True)
-        x = torch.cat([x1, x2], dim=1)
+        x1,_ = torch.min(gcn, dim=0, keepdim=True)
+        x2 = torch.mean(gcn, dim=0, keepdim=True)
+        x3,_ = torch.max(gcn, dim=0, keepdim=True)
+        x = torch.cat([x1, x2, x3], dim=1)
         x = F.leaky_relu(self.fc1(x))
-        shortcut = x
-        x = F.leaky_relu(self.fc2(x))
-        x = F.leaky_relu(self.fc3(x))
-        x = F.leaky_relu(self.fc4(x))
-        x = self.fc5(x + shortcut)
+        # shortcut = x
+        # x = F.leaky_relu(self.fc2(x))
+        # x = F.leaky_relu(self.fc3(x))
+        # x = F.leaky_relu(self.fc4(x))
+        x = self.fc5(x)
         return x
