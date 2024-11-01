@@ -262,5 +262,5 @@ def find_strongly_connected_components(edge_index, num_nodes):
 def extract_text_from_graph(graph, nodes, edges):    
     node_texts = [node["text"] for node in nodes if "text" in node]
     # Concatenate all text into a single string
-    concatenated_text = " ".join(node_texts)
+    concatenated_text = "\n".join(node_texts)
     return concatenated_text

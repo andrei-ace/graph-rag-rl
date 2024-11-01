@@ -1,7 +1,7 @@
 import random
 import torch
 from torch_geometric.data import Data
-from config import EMBEDDINGS_TOKEN_LIMIT, HIDDEN_DIM, SPLIT, START_TEMP, END_TEMP, DECAY_RATE, EPOCHS
+from config import EMBEDDINGS_TOKEN_LIMIT, HIDDEN_DIM, LR_END, LR_START, SPLIT, START_TEMP, END_TEMP, DECAY_RATE, EPOCHS
 from models import CriticNetwork, PolicyNetwork
 from rag import rag
 from graphs import find_strongly_connected_components
@@ -13,11 +13,13 @@ import shutil
 
 MIN_STEPS = 2
 MAX_STEPS = 256
-REPEAT_TRAJECTORIES = 8
-TRAJECTORY_TRAIN_EPOCHS = 8
-RAG_SKIP_STEPS = 32
+REPEAT_TRAJECTORIES = 2
+TRAJECTORY_TRAIN_EPOCHS = 2
+RAG_SKIP_STEPS = 16
 NUM_TRAJECTORIES = 16
 SAMPLE_SIZE = 8
+
+BATCH_SIZE = 8
 
 class PPOConfig(PretrainedConfig):
     def __init__(self, input_dim=None, hidden_dim=None, **kwargs):
@@ -29,7 +31,9 @@ class PPOConfig(PretrainedConfig):
 
 class PPO:
     def __init__(self,
-                 config: PPOConfig,                 
+                 config: PPOConfig,
+                 lr_start=LR_START,
+                 lr_end=LR_END,
                  device="cpu"):        
         self.config = config
         self.device = torch.device(device)
@@ -44,8 +48,18 @@ class PPO:
         self.optimizer = torch.optim.Adam(
             list(self.policy_net.parameters())
             + list(self.critic_net.parameters()),
-            lr=1e-6,
+            lr=lr_start,
         )
+        
+        # Calculate decay rate for ExponentialLR
+        decay_rate = (lr_end / lr_start) ** (1 / EPOCHS)
+        
+        # Initialize learning rate scheduler
+        self.scheduler = torch.optim.lr_scheduler.ExponentialLR(
+            self.optimizer,
+            gamma=decay_rate
+        )
+        
         # Initialize loss functions for PPO
         self.value_loss_fn = torch.nn.MSELoss()        
         self.gamma = config.gamma
@@ -55,6 +69,7 @@ class PPO:
         self.episode_num = 0
         self.split = SPLIT
         self.start_temp = START_TEMP
+        self.temperature = START_TEMP
         self.end_temp = END_TEMP
         self.decay_rate = DECAY_RATE
         self.num_trajectories = NUM_TRAJECTORIES
@@ -63,7 +78,7 @@ class PPO:
     @classmethod
     def from_pretrained(cls, path, config: PPOConfig, device="cpu"):
         """Initialize PPO with pre-trained weights."""
-        instance = cls(config, device)
+        instance = cls(config=config, device=device)
         instance.policy_net = PolicyNetwork.from_pretrained(path)
         instance.critic_net = CriticNetwork.from_pretrained(path)
         instance.optimizer.load_state_dict(torch.load(os.path.join(path, 'optimizer.pt'), map_location=device))
@@ -73,7 +88,7 @@ class PPO:
     @classmethod
     def for_training(cls, config: PPOConfig, device="cpu"):
         """Initialize PPO for training with new weights."""
-        return cls(config, device)
+        return cls(config=config, device=device)
     
     def save_model(self, path):
         """Save the model parameters and configuration to the specified path using Hugging Face."""
@@ -99,7 +114,7 @@ class PPO:
         config = PPOConfig.from_pretrained(path)
         
         # Create an instance of the class
-        instance = cls(config, device)
+        instance = cls(config=config, device=device)
         
         # Load the policy network state_dict
         instance.policy_net.load_state_dict(torch.load(os.path.join(path, 'policy_net.bin'), map_location=instance.device))
@@ -140,6 +155,7 @@ class PPO:
             'episodes': self.episodes,
             'episode_num': self.episode_num,
             'split': self.split,
+            'lr': self.scheduler.get_last_lr()[0],
             'temperature': self.start_temp,
             'start_temp': self.start_temp,
             'end_temp': self.end_temp,
@@ -170,7 +186,7 @@ class PPO:
         config = PPOConfig.from_pretrained(path)
         
         # Initialize networks with the loaded configuration
-        instance = cls(config, device=device)
+        instance = cls(config=config, device=device)
         instance.policy_net = PolicyNetwork(config.input_dim, config.hidden_dim)
         instance.critic_net = CriticNetwork(config.input_dim, config.hidden_dim)
         
@@ -193,7 +209,13 @@ class PPO:
         instance.split = checkpoint.get('split', instance.split)
         instance.start_temp = checkpoint.get('start_temp', instance.start_temp)
         instance.end_temp = checkpoint.get('end_temp', instance.end_temp)
-        instance.decay_rate = checkpoint.get('decay_rate', instance.decay_rate)        
+        instance.decay_rate = checkpoint.get('decay_rate', instance.decay_rate)
+        
+        # Set the learning rate directly on the optimizer
+        lr = checkpoint.get('lr', instance.scheduler.get_last_lr()[0])
+        for param_group in instance.optimizer.param_groups:
+            param_group['lr'] = lr
+
         return instance
 
     def max_steps_for_episode(self, episode_num):
@@ -236,7 +258,7 @@ class PPO:
             evaluate_num_edges() * 0.1 +              
             evaluate_token_distribution() * 0.8
         )
-        return overall_score
+        return overall_score * 0.1
 
 
     def calculate_rag_score(self, graph, nodes, edges, questions_answers):
@@ -259,7 +281,7 @@ class PPO:
         return graph, nodes, edges
     
 
-    def generate_trajectory(self, graph, nodes, edges, questions_answers, episode_num, starting_value_rag=None):
+    def generate_trajectory(self, graph, nodes, edges, questions_answers, starting_value_rag=None):
         trajectory = []
         improvement = None
         graph = Data(x=graph.x, edge_index=graph.edge_index.clone())
@@ -270,7 +292,7 @@ class PPO:
         self.critic_net.eval()
         with torch.inference_mode():
                         
-            starting_value = self.calculate_shaped_reward(graph, nodes, edges) if episode_num < self.episodes * self.split else 0.0
+            starting_value = self.calculate_shaped_reward(graph, nodes, edges) if self.episode_num < self.episodes * self.split else 0.0
             current_value = starting_value
             if starting_value_rag is None:
                 starting_value_rag = self.calculate_rag_score(graph, nodes, edges, questions_answers)
@@ -278,7 +300,7 @@ class PPO:
             rag_score = None
             value = None
 
-            max_steps = self.max_steps_for_episode(episode_num)
+            max_steps = self.max_steps_for_episode(self.episode_num)
             for i in range(max_steps):
                 node1_soft, node2_soft, edge_type_soft, stop_soft = self.policy_net(graph.x, graph.edge_index)
                 # if node1 or node 2 are None then we stop
@@ -312,8 +334,8 @@ class PPO:
                 if value is None:
                     value = starting_value
                 else:
-                    value = self.calculate_shaped_reward(graph, nodes, edges) if episode_num < self.episodes * self.split else 0.0
-                if i>0 and (last_step or i%RAG_SKIP_STEPS==0): # and (episode_num >= self.episodes * self.split):
+                    value = self.calculate_shaped_reward(graph, nodes, edges) if self.episode_num < self.episodes * self.split else 0.0
+                if i>=RAG_SKIP_STEPS and (last_step or i%RAG_SKIP_STEPS==0): # and (self.episode_num >= self.episodes * self.split):
                     if rag_score is None:
                         rag_score = self.calculate_rag_score(graph, nodes, edges, questions_answers)
                     value += rag_score - current_rag_score
@@ -325,7 +347,6 @@ class PPO:
                 if i > 0 and last_step:
                     if rag_score is None:
                         rag_score = self.calculate_rag_score(graph, nodes, edges, questions_answers)
-                    # if abs(rag_score - starting_value_rag) > 1e-7:
                     improvement = rag_score - starting_value_rag
                     total_reward = sum(reward for _, _, _, reward, _ in trajectory)
                     
@@ -334,10 +355,7 @@ class PPO:
                     num_components = len(strongly_connected_components)
                     print(f"Length: {i+1:3d}, SCC: {num_components:3d} of {num_nodes:3d}, " +
                         f"Starting RAG score: {starting_value_rag:.7f}, Current RAG score: {rag_score:.7f}, " +
-                        f"Improvement RAG: {improvement:+.7f}, Total reward: {total_reward:+.7f}")
-                    # print(f"Length: {i+1:3d}, SCC: {num_components:3d} of {num_nodes:3d}, " +
-                    #     f"Starting score: {starting_value:.7f}, Current score: {current_value:.7f}, " +
-                    #     f"Total reward: {total_reward:+.7f}")
+                        f"Improvement RAG: {improvement:+.7f}, Total reward: {total_reward:+.7f}")                    
                     break
                                 
         return improvement, trajectory
@@ -383,9 +401,14 @@ class PPO:
         returns = np.array(returns)
         return advantages, returns
 
-    def run_episode(self, episode_num, graph, nodes, edges, questions_answers, temperature):
+    def step(self, episode_num, temperature):
         self.episode_num = episode_num
-        self.policy_net.set_temperature(temperature)
+        self.temperature = temperature
+        self.scheduler.step()
+
+
+    def run_episode(self, graph, nodes, edges, questions_answers):
+        self.policy_net.set_temperature(self.temperature)
         
         # Set networks to evaluation mode for the episode
         self.policy_net.eval()
@@ -398,7 +421,7 @@ class PPO:
             with torch.inference_mode():    
                 while True:  # Keep generating trajectories until we get one with at least min_steps                    
                     improvement, trajectory = self.generate_trajectory(
-                        graph, nodes, edges, questions_answers, episode_num, starting_value_rag)                
+                        graph, nodes, edges, questions_answers, starting_value_rag)                
                     
                     if len(trajectory) >= MIN_STEPS:
                         break  # Exit the loop if the trajectory has at least min_steps                
@@ -414,81 +437,169 @@ class PPO:
         results.sort(key=lambda x: x[0])
         results = results[:SAMPLE_SIZE] + results[-SAMPLE_SIZE:]        
 
-        results = normalize_advantages(results)
+        # results = normalize_advantages(results)
         improvement_sum = 0.0
         for improvement, trajectory, advantages, returns in results:                
             improvement_sum += improvement            
                 
         print(f"Starting training for {len(results)} trajectories, average RAG improvement: {improvement_sum / len(results):.7f}...")        
+        # for _ in range(REPEAT_TRAJECTORIES):
+        #     random.shuffle(results)
+        #     for improvement, trajectory, advantages, returns in results:
+        #         self.update_networks(trajectory, advantages, returns, graph, nodes, edges)
+
         for _ in range(REPEAT_TRAJECTORIES):
             random.shuffle(results)
-            for improvement, trajectory, advantages, returns in results:                
-                self.update_policy(trajectory, advantages, returns, graph, nodes, edges)
+            # split result into batch_size batches
+            batches = [results[i:i+BATCH_SIZE] for i in range(0, len(results), BATCH_SIZE)]
+            for batch in batches:
+                self.update_networks_batch(batch, graph, nodes, edges)
         print(f"Training complete")
 
-    def update_policy(self, trajectory, advantages, returns, graph, nodes, edges, epsilon=0.2):
-        # print(f"Advantages: {advantages}")
+
+    def update_networks_batch(self, results, graph, nodes, edges, epsilon=0.2):
         self.policy_net.train()
         self.critic_net.train()
+        old_log_probs_list = []
+        advantages_list = []
+        returns_list = []
+        trajectory_list = []
+        for _, trajectory, advantages, returns in results:
+            old_log_probs = torch.stack([torch.log(torch.tensor(action_prob, device=self.device)) for _, _, action_prob, _, _ in trajectory])            
+            advantages = torch.tensor(advantages, dtype=torch.float32, device=self.device)
+            returns = torch.tensor(returns, dtype=torch.float32, device=self.device)
+            old_log_probs_list.append(old_log_probs)
+            advantages_list.append(advantages)
+            returns_list.append(returns)            
+            trajectory_list.append(trajectory)
 
-        # Calculate old_log_probs once, outside the loop
-        old_log_probs = torch.stack([torch.log(torch.tensor(action_prob, device=self.device)) for _, _, action_prob, _, _ in trajectory])
-
-        advantages = torch.tensor(advantages, dtype=torch.float32, device=self.device)
-        returns = torch.tensor(returns, dtype=torch.float32, device=self.device)
-        
-        # Normalize advantages
-        # advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-                
         for epoch in range(TRAJECTORY_TRAIN_EPOCHS):
             self.optimizer.zero_grad()
-            new_log_probs = []
-            new_values = []            
+            total_loss = 0.0
 
-            current_graph = Data(x=graph.x, edge_index=graph.edge_index.clone()).to(self.device)
-            current_graph = current_graph.to(self.device)
-            current_nodes = nodes.copy()
-            current_edges = edges.copy()
-
-            for i, ((node1_idx, node2_idx), edge_type_idx, _, _, done) in enumerate(trajectory):
-                node1_soft, node2_soft, edge_type_soft, stop_soft = self.policy_net(current_graph.x, current_graph.edge_index)
-                if node1_soft is None or node2_soft is None or edge_type_soft is None or stop_soft is None:
-                    break
-                    
-                if done == 1:
-                    log_action_prob = torch.log(node1_soft[0][node1_idx] * node2_soft[0][node2_idx] * 
+            for old_log_probs, advantages, returns, trajectory in zip(old_log_probs_list, advantages_list, returns_list, trajectory_list):
+                current_graph = Data(x=graph.x, edge_index=graph.edge_index.clone()).to(self.device)
+                current_graph = current_graph.to(self.device)
+                current_nodes = nodes.copy()
+                current_edges = edges.copy()                
+                new_log_probs = []
+                new_values = []
+                prev_node1_soft, prev_node2_soft, prev_edge_type_soft, prev_stop_soft = None, None, None, None
+                for (node1_idx, node2_idx), edge_type_idx, _, _, done in trajectory:
+                    node1_soft, node2_soft, edge_type_soft, stop_soft = self.policy_net(current_graph.x, current_graph.edge_index)
+                    if node1_soft is None or node2_soft is None or edge_type_soft is None or stop_soft is None:
+                        # reset to previous state and break
+                        node1_soft, node2_soft, edge_type_soft, stop_soft = prev_node1_soft, prev_node2_soft, prev_edge_type_soft, prev_stop_soft
+                        log_action_prob = torch.log(node1_soft[0][node1_idx] * node2_soft[0][node2_idx] * 
                                             edge_type_soft[0][edge_type_idx] * stop_soft[0][1] + 1e-10)
-                else:
-                    log_action_prob = torch.log(node1_soft[0][node1_idx] * node2_soft[0][node2_idx] * 
-                                            edge_type_soft[0][edge_type_idx] * stop_soft[0][0] + 1e-10)
-                new_log_probs.append(log_action_prob)
+                        new_log_probs.append(log_action_prob)
+                        break
+                        
+                    if done == 1:
+                        log_action_prob = torch.log(node1_soft[0][node1_idx] * node2_soft[0][node2_idx] * 
+                                                edge_type_soft[0][edge_type_idx] * stop_soft[0][1] + 1e-10)
+                    else:
+                        log_action_prob = torch.log(node1_soft[0][node1_idx] * node2_soft[0][node2_idx] * 
+                                                edge_type_soft[0][edge_type_idx] * stop_soft[0][0] + 1e-10)
+                    new_log_probs.append(log_action_prob)
 
-                value_new = self.critic_net(current_graph.x, current_graph.edge_index)
-                new_values.append(value_new)
+                    value_new = self.critic_net(current_graph.x, current_graph.edge_index)
+                    new_values.append(value_new)
 
-                current_graph, current_nodes, current_edges = self.modify_graph(
-                    current_graph, current_nodes, current_edges, node1_idx, node2_idx, edge_type_idx)
+                    current_graph, current_nodes, current_edges = self.modify_graph(
+                        current_graph, current_nodes, current_edges, node1_idx, node2_idx, edge_type_idx)
+                    
+                    prev_node1_soft = node1_soft
+                    prev_node2_soft = node2_soft
+                    prev_edge_type_soft = edge_type_soft
+                    prev_stop_soft = stop_soft
+                    
+                new_log_probs = torch.stack(new_log_probs)
+                new_values = torch.stack(new_values).squeeze()
 
-            new_log_probs = torch.stack(new_log_probs)
-            new_values = torch.stack(new_values).squeeze()
+                # Create a temporary truncated version of old_log_probs
+                truncated_old_log_probs = old_log_probs[:len(new_log_probs)]
+                
+                ratio = torch.exp(new_log_probs - truncated_old_log_probs)
+                
+                surr1 = ratio * advantages[:len(new_log_probs)]
+                surr2 = torch.clamp(ratio, 1 - epsilon, 1 + epsilon) * advantages[:len(new_log_probs)]
+                policy_loss = -torch.min(surr1, surr2).mean()
 
-            # Create a temporary truncated version of old_log_probs
-            truncated_old_log_probs = old_log_probs[:len(new_log_probs)]
-            
-            ratio = torch.exp(new_log_probs - truncated_old_log_probs)
-            
-            surr1 = ratio * advantages[:len(new_log_probs)]
-            surr2 = torch.clamp(ratio, 1 - epsilon, 1 + epsilon) * advantages[:len(new_log_probs)]
-            policy_loss = -torch.min(surr1, surr2).mean()
+                value_loss = self.value_loss_fn(new_values, returns[:len(new_log_probs)])
 
-            value_loss = self.value_loss_fn(new_values, returns[:len(new_log_probs)])
-
-            total_loss = policy_loss + 0.1 * value_loss
+                total_loss += policy_loss + 0.5 * value_loss
             
             total_loss.backward()
+            # clip gradients
+            torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), 0.5)
+            torch.nn.utils.clip_grad_norm_(self.critic_net.parameters(), 0.5)
             self.optimizer.step()
+                
+
+    # def update_networks(self, trajectory, advantages, returns, graph, nodes, edges, epsilon=0.2):
+    #     # print(f"Advantages: {advantages}")
+    #     self.policy_net.train()
+    #     self.critic_net.train()
+
+    #     # Calculate old_log_probs once, outside the loop
+    #     old_log_probs = torch.stack([torch.log(torch.tensor(action_prob, device=self.device)) for _, _, action_prob, _, _ in trajectory])
+
+    #     advantages = torch.tensor(advantages, dtype=torch.float32, device=self.device)
+    #     returns = torch.tensor(returns, dtype=torch.float32, device=self.device)
+        
+    #     # Normalize advantages
+    #     # advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+                
+    #     for epoch in range(TRAJECTORY_TRAIN_EPOCHS):
+    #         self.optimizer.zero_grad()
+    #         new_log_probs = []
+    #         new_values = []
+
+    #         current_graph = Data(x=graph.x, edge_index=graph.edge_index.clone()).to(self.device)
+    #         current_graph = current_graph.to(self.device)
+    #         current_nodes = nodes.copy()
+    #         current_edges = edges.copy()
+
+    #         for i, ((node1_idx, node2_idx), edge_type_idx, _, _, done) in enumerate(trajectory):
+    #             node1_soft, node2_soft, edge_type_soft, stop_soft = self.policy_net(current_graph.x, current_graph.edge_index)
+    #             if node1_soft is None or node2_soft is None or edge_type_soft is None or stop_soft is None:
+    #                 break
+                    
+    #             if done == 1:
+    #                 log_action_prob = torch.log(node1_soft[0][node1_idx] * node2_soft[0][node2_idx] * 
+    #                                         edge_type_soft[0][edge_type_idx] * stop_soft[0][1] + 1e-10)
+    #             else:
+    #                 log_action_prob = torch.log(node1_soft[0][node1_idx] * node2_soft[0][node2_idx] * 
+    #                                         edge_type_soft[0][edge_type_idx] * stop_soft[0][0] + 1e-10)
+    #             new_log_probs.append(log_action_prob)
+
+    #             value_new = self.critic_net(current_graph.x, current_graph.edge_index)
+    #             new_values.append(value_new)
+
+    #             current_graph, current_nodes, current_edges = self.modify_graph(
+    #                 current_graph, current_nodes, current_edges, node1_idx, node2_idx, edge_type_idx)
+
+    #         new_log_probs = torch.stack(new_log_probs)
+    #         new_values = torch.stack(new_values).squeeze()
+
+    #         # Create a temporary truncated version of old_log_probs
+    #         truncated_old_log_probs = old_log_probs[:len(new_log_probs)]
             
-        return graph, nodes, edges
+    #         ratio = torch.exp(new_log_probs - truncated_old_log_probs)
+            
+    #         surr1 = ratio * advantages[:len(new_log_probs)]
+    #         surr2 = torch.clamp(ratio, 1 - epsilon, 1 + epsilon) * advantages[:len(new_log_probs)]
+    #         policy_loss = -torch.min(surr1, surr2).mean()
+
+    #         value_loss = self.value_loss_fn(new_values, returns[:len(new_log_probs)])
+
+    #         total_loss = policy_loss + 0.5 * value_loss
+            
+    #         total_loss.backward()
+    #         self.optimizer.step()
+            
+    #     return graph, nodes, edges
     
 
     def infer_trajectory(self, graph, nodes, edges):

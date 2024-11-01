@@ -75,19 +75,20 @@ def infer_pdf(pdf_entry, ppo, device=device) -> tuple[float, int, int]:
         save_path = "docs/output/with_trainig.png"
     # visualize_graph(merged_image, merged_nodes, merged_edges, save_path=save_path)
     results = rag(merged_graph, merged_nodes, merged_edges, questions_answers)
-    # for question, answer, generated_answer, score in results:
-    #     print(f"Question: {question}\nProvided Answer:{answer}\nGenerated Answer: {generated_answer}\nScore: {score:.4f}")
-    #     print("-" * 100)
+    if ppo is None:
+        for question, answer, generated_answer, score in results:
+            print(f"Question: {question}\nProvided Answer:{answer}\nGenerated Answer: {generated_answer}\nScore: {score:.4f}")
+            print("-" * 100)
     mean_score = sum([score for _, _, _, score in results]) / len(results)
     return mean_score, scc_count, path_length
 
 
-def train_pdf(pdf_entry, ppo, episode_num, temperature, device=device):
+def train_pdf(pdf_entry, ppo, device=device):
     (pdf_path, questions_answers) = pdf_entry
     cache_key = os.path.basename(pdf_path)
     merged_graph, merged_nodes, merged_edges, _ = cache_results(cache_key, process_pdf, pdf_path)
     merged_graph = merged_graph.to(device)
-    ppo.run_episode(episode_num, merged_graph, merged_nodes, merged_edges, questions_answers, temperature)
+    ppo.run_episode(merged_graph, merged_nodes, merged_edges, questions_answers)
 
 
 def determine_temperature(episode_num):
@@ -161,11 +162,13 @@ if __name__ == "__main__":
     pbar = tqdm(total=EPOCHS, desc="Training PPO")
     
     for episode_num in range(start_episode, EPOCHS):
-        pbar.n = episode_num
-        pbar.refresh()
-        temperature = determine_temperature(episode_num)
+        pbar.n = episode_num        
+        pbar.refresh()        
         for pdf_entry in PDFS:        
-            train_pdf(pdf_entry, ppo, episode_num, temperature)
+            train_pdf(pdf_entry, ppo)
+        temperature = determine_temperature(episode_num)
+        next_temperature = determine_temperature(episode_num+1)
+        ppo.step(episode_num, next_temperature)
         
         inferred = [infer_pdf(pdf, ppo) for pdf in PDFS]
         mean_score_withtrain = sum(score for score, _, _ in inferred) / len(PDFS)
@@ -173,6 +176,7 @@ if __name__ == "__main__":
         mean_path_length = sum(path_length for _, _, path_length in inferred) / len(PDFS)
 
         # Log metrics to TensorBoard
+        writer.add_scalar('LR', ppo.scheduler.get_last_lr()[0], episode_num)
         writer.add_scalar('Temperature', temperature, episode_num)
         writer.add_scalar('Mean Score No Train', mean_score_notrain, episode_num)
         writer.add_scalar('Mean Score With Train', mean_score_withtrain, episode_num)
@@ -182,8 +186,8 @@ if __name__ == "__main__":
 
         pbar.set_postfix({
             'Temperature': f'{temperature:.7f}',
-            'No Train': f'{mean_score_notrain:.7f}',
-            'With Train': f'{mean_score_withtrain:.7f}',
+            'LR': f'{ppo.scheduler.get_last_lr()[0]:.7f}',
+            'No Train': f'{mean_score_notrain:.7f}',            
             'Improvement': f'{mean_score_withtrain - mean_score_notrain:.7f}'            
         })
         # save the model

@@ -1,4 +1,4 @@
-from torch.nn.functional import cosine_similarity, softmax
+from torch.nn.functional import cosine_similarity, sigmoid
 from graphs import extract_text_from_graph, split_graph
 from embeddings import get_nvidia_nim_embeddings
 import requests
@@ -8,7 +8,7 @@ import math
 
 from config import RANK_MODEL, RANK_URL, TOP_K
 
-def rank_answers(question, retrieved_text_list, 
+def rank_answers(question, correct_answer, retrieved_text_list, 
                  model: str = RANK_MODEL,
                  url: str = RANK_URL) -> tuple[float, str]:
     headers = {
@@ -18,69 +18,36 @@ def rank_answers(question, retrieved_text_list,
     payload = {
         "model": model,
         "query": {"text": question},
-        "passages": [{"text": text} for text in retrieved_text_list],
+        "passages": [{"text": correct_answer}] + [{"text": text} for text in retrieved_text_list],
         "truncate": "END"
     }
 
     response = requests.post(url, headers=headers, data=json.dumps(payload))
     if response.status_code == 200:
         results = response.json()
+        rankings = results['rankings']
+        # order by index as the list index is not guaranteed to be in order
+        rankings.sort(key=lambda x: x['index'])
         # Extract logits for each retrieved text
-        logits = [result['logit'] for result in results['rankings']]
+        logits = [result['logit'] for result in rankings]
         
-        # Apply softmax to normalize logits
-        exp_logits = [math.exp(logit) for logit in logits]
-        total = sum(exp_logits)
-        probabilities = [exp_logit / total for exp_logit in exp_logits]
+        # scale logits so the correct answer logit
+        logits_tensor = torch.tensor(logits)
+        logits_tensor = logits_tensor / logits_tensor[0] * 4
+
+        # convert to probabilities
+        probabilities = sigmoid(logits_tensor).tolist()
         
-        # Find the best score and its corresponding text
-        best_score = max(probabilities)
+        # Find the best score and its corresponding text, ignore the correct answer (index 0)
+        probabilities = probabilities[1:]
+        best_score = max(probabilities)        
         best_index = probabilities.index(best_score)
-        best_relevant_text = retrieved_text_list[best_index]
+        best_relevant_text = retrieved_text_list[best_index]        
         
         return best_score, best_relevant_text  # Return best score and text
     else:
         print(f"Error: {response.status_code}")
         return 0, ""  # Return zero score and empty text in case of error
-
-
-def evaluate_answer(question, retrieved_text, correct_answer, 
-                    model: str = RANK_MODEL,
-                    url: str = RANK_URL) -> float:
-    headers = {
-        'accept': 'application/json',
-        'Content-Type': 'application/json'
-    }
-    payload = {
-        "model": model,
-        "query": {"text": question},
-        "passages": [
-            {"text": retrieved_text},
-            {"text": correct_answer}
-        ],
-        "truncate": "END"
-    }
-
-    response = requests.post(url, headers=headers, data=json.dumps(payload))
-    if response.status_code == 200:
-        results = response.json()
-        retrieved_logit = results['rankings'][0]['logit']
-        correct_logit = results['rankings'][1]['logit']
-        
-        # Use softmax to normalize logits
-        logits = torch.tensor([retrieved_logit, correct_logit])
-        probabilities = softmax(logits, dim=0)
-        
-        retrieved_prob = probabilities[0].item()
-        correct_prob = probabilities[1].item()
-        
-        # Calculate similarity based on normalized probabilities
-        similarity = 1 - abs(retrieved_prob - correct_prob)
-        
-        return similarity  # Already in [0, 1] range
-    else:
-        print(f"Error: {response.status_code}")
-        return 0  # Return 0 similarity in case of error
 
 
 def retrieve_relevant_text(question_embedding, text_embeddings, texts, top_k=1) -> list[str]:
@@ -113,10 +80,8 @@ def rag(graph, nodes, edges, questions_answers) -> list[tuple[str, str, str, flo
     for question, provided_answer, question_embedding in zip(questions, answers, question_embeddings):
         relevant_text_list = retrieve_relevant_text(question_embedding, text_embeddings, texts, top_k=TOP_K)
         # Get the best score and relevant text
-        best_score, best_relevant_text = rank_answers(question, relevant_text_list)
-        
-        score = evaluate_answer(question, best_relevant_text, provided_answer)
-        results.append((question, provided_answer, best_relevant_text, score))
+        best_score, best_relevant_text = rank_answers(question, provided_answer, relevant_text_list)
+        results.append((question, provided_answer, best_relevant_text, best_score))
         
 
     return results
