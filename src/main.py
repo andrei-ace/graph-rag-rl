@@ -119,7 +119,7 @@ def determine_temperature(episode_num):
 
 
 if __name__ == "__main__":
-    PDFS = PDFS[:-1]
+    PDFS = PDFS[:-2]
     parser = argparse.ArgumentParser(description="Process PDF with optional caching.")
     parser.add_argument("--disable-cache", action="store_true", help="Disable caching of results")
     parser.add_argument("--continue-from-last-checkpoint", action="store_true", help="Continue training from the last checkpoint")
